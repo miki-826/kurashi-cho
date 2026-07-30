@@ -122,12 +122,16 @@ class ReceiptDraft {
     this.merchant,
     this.amount,
     this.date,
+    this.category = 'other',
+    this.rawText = '',
   });
 
   final String imagePath;
   final String? merchant;
   final int? amount;
   final DateTime? date;
+  final String category;
+  final String rawText;
 
   factory ReceiptDraft.fromRecognizedText(String imagePath, String rawText) {
     final lines = rawText
@@ -135,25 +139,32 @@ class ReceiptDraft {
         .map((line) => line.trim())
         .where((line) => line.isNotEmpty)
         .toList();
-    final merchant = lines
-        .take(6)
-        .cast<String?>()
-        .firstWhere(
-          (line) =>
-              line != null &&
-              !RegExp(r'\d{2,}').hasMatch(line) &&
-              !line.contains('TEL') &&
-              !line.contains('レシート'),
-          orElse: () => null,
-        );
+    String? merchant;
+    for (final line in lines.take(8)) {
+      if (!RegExp(r'\d{2,}').hasMatch(line) &&
+          !line.toUpperCase().contains('TEL') &&
+          !line.contains('レシート') &&
+          line.length >= 2) {
+        merchant = line;
+        break;
+      }
+    }
     final totalPattern = RegExp(
       r'(?:合\s*計|お買上|請求額|ご利用額|支払額)[^0-9]{0,12}([0-9][0-9,]{1,})',
       caseSensitive: false,
     );
     final matches = totalPattern.allMatches(rawText).toList();
-    final amount = matches.isEmpty
+    int? amount = matches.isEmpty
         ? null
         : int.tryParse(matches.last.group(1)!.replaceAll(',', ''));
+    if (amount == null) {
+      final yenMatches = RegExp(r'[¥￥]\s*([0-9][0-9,]*)')
+          .allMatches(rawText)
+          .map((match) => int.tryParse(match.group(1)!.replaceAll(',', '')))
+          .whereType<int>()
+          .toList();
+      if (yenMatches.isNotEmpty) amount = yenMatches.reduce(max);
+    }
     final dateMatch = RegExp(
       r'(20\d{2})[./年-]\s*(\d{1,2})[./月-]\s*(\d{1,2})',
     ).firstMatch(rawText);
@@ -170,7 +181,17 @@ class ReceiptDraft {
       merchant: merchant,
       amount: amount,
       date: date,
+      category: _categoryFromText(rawText),
+      rawText: rawText,
     );
+  }
+
+  static String _categoryFromText(String text) {
+    if (RegExp(r'スーパー|コンビニ|食品|弁当|飲食|カフェ|レストラン').hasMatch(text)) return 'food';
+    if (RegExp(r'電車|バス|タクシー|交通').hasMatch(text)) return 'transport';
+    if (RegExp(r'ドラッグ|日用品|洗剤|ティッシュ').hasMatch(text)) return 'daily';
+    if (RegExp(r'映画|ゲーム|書籍|チケット').hasMatch(text)) return 'leisure';
+    return 'other';
   }
 }
 
@@ -1246,27 +1267,37 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
   ReceiptDraft? _draft;
   String? _error;
 
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _readReceipt());
+  }
+
   Future<void> _readReceipt() async {
+    if (_isReading) return;
     setState(() {
       _isReading = true;
       _error = null;
     });
-    final recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
+    TextRecognizer? recognizer;
     try {
+      recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
       final result = await recognizer.processImage(
         InputImage.fromFilePath(widget.imagePath),
       );
       if (!mounted) return;
-      setState(
-        () => _draft = ReceiptDraft.fromRecognizedText(
-          widget.imagePath,
-          result.text,
-        ),
-      );
+      setState(() {
+        _draft = ReceiptDraft.fromRecognizedText(widget.imagePath, result.text);
+        if (result.text.trim().isEmpty) {
+          _error = '文字を検出できませんでした。明るい場所で、文字が正面に写るよう撮影してください。';
+        }
+      });
     } catch (_) {
-      if (mounted) setState(() => _error = '文字を読み取れませんでした。手入力で続けられます。');
+      if (mounted) {
+        setState(() => _error = '文字を読み取れませんでした。写真は添えたまま手入力で続けられます。');
+      }
     } finally {
-      await recognizer.close();
+      await recognizer?.close();
       if (mounted) setState(() => _isReading = false);
     }
   }
@@ -1284,10 +1315,10 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
           constraints: const BoxConstraints(maxWidth: 680),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
+            child: ListView(
               children: [
-                Expanded(
+                SizedBox(
+                  height: 280,
                   child: ClipRRect(
                     borderRadius: BorderRadius.circular(24),
                     child: ColoredBox(
@@ -1320,9 +1351,33 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                 ),
                 const SizedBox(height: 5),
                 const Text(
-                  '写真は端末内で読み取れます。内容は保存前に必ず確認・修正できます。',
+                  '端末内で文字を読み取っています。内容は保存前に必ず確認・修正できます。',
                   style: TextStyle(color: Color(0xFF6D777B), height: 1.45),
                 ),
+                if (_isReading) ...[
+                  const SizedBox(height: 14),
+                  Container(
+                    padding: const EdgeInsets.all(13),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE9EFE3),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: const Row(
+                      children: [
+                        SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _sage,
+                          ),
+                        ),
+                        SizedBox(width: 10),
+                        Text('レシートの文字を読み取っています…'),
+                      ],
+                    ),
+                  ),
+                ],
                 if (_draft != null) ...[
                   const SizedBox(height: 14),
                   _OcrCandidateCard(draft: _draft!),
@@ -1347,7 +1402,7 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                           ),
                         )
                       : const Icon(Icons.document_scanner_rounded),
-                  label: Text(_isReading ? '端末内で読み取り中…' : '写真から下書きを作る'),
+                  label: Text(_isReading ? '端末内で読み取り中…' : 'もう一度読み取る'),
                   style: FilledButton.styleFrom(
                     backgroundColor: _ink,
                     foregroundColor: _paper,
@@ -1356,10 +1411,12 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                 ),
                 const SizedBox(height: 9),
                 OutlinedButton.icon(
-                  onPressed: () => Navigator.pop(
-                    context,
-                    _draft ?? ReceiptDraft(imagePath: widget.imagePath),
-                  ),
+                  onPressed: _isReading
+                      ? null
+                      : () => Navigator.pop(
+                          context,
+                          _draft ?? ReceiptDraft(imagePath: widget.imagePath),
+                        ),
                   icon: const Icon(Icons.edit_note_rounded),
                   label: Text(_draft == null ? '手入力で続ける' : 'この内容で入力を続ける'),
                   style: OutlinedButton.styleFrom(
@@ -1401,6 +1458,32 @@ class _OcrCandidateCard extends StatelessWidget {
         Text('金額: ${draft.amount == null ? '未検出' : _yen.format(draft.amount)}'),
         Text(
           '日付: ${draft.date == null ? '未検出' : _dateFormat.format(draft.date!)}',
+        ),
+        const SizedBox(height: 10),
+        const Text(
+          '読み取った文字',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w800,
+            color: Color(0xFF5E6A61),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(9),
+          decoration: BoxDecoration(
+            color: const Color(0x88FFFFFF),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            draft.rawText.trim().isEmpty
+                ? '文字を検出できませんでした。写真を添えたまま手入力できます。'
+                : draft.rawText.trim(),
+            maxLines: 5,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 12, height: 1.35),
+          ),
         ),
       ],
     ),
@@ -1705,7 +1788,7 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
     );
     _note = TextEditingController(text: value?.note ?? '');
     _date = value?.date ?? draft?.date ?? DateTime.now();
-    _category = value?.category ?? 'food';
+    _category = value?.category ?? draft?.category ?? 'other';
     _payment = value?.payment ?? '現金';
   }
 
