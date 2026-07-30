@@ -4,10 +4,12 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:share_plus/share_plus.dart';
 
 const _ink = Color(0xFF23313D);
 const _paper = Color(0xFFFFFBF3);
@@ -112,6 +114,64 @@ class BudgetCategory {
   final String name;
   final IconData icon;
   final Color color;
+}
+
+class ReceiptDraft {
+  const ReceiptDraft({
+    required this.imagePath,
+    this.merchant,
+    this.amount,
+    this.date,
+  });
+
+  final String imagePath;
+  final String? merchant;
+  final int? amount;
+  final DateTime? date;
+
+  factory ReceiptDraft.fromRecognizedText(String imagePath, String rawText) {
+    final lines = rawText
+        .split(RegExp(r'\r?\n'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    final merchant = lines
+        .take(6)
+        .cast<String?>()
+        .firstWhere(
+          (line) =>
+              line != null &&
+              !RegExp(r'\d{2,}').hasMatch(line) &&
+              !line.contains('TEL') &&
+              !line.contains('レシート'),
+          orElse: () => null,
+        );
+    final totalPattern = RegExp(
+      r'(?:合\s*計|お買上|請求額|ご利用額|支払額)[^0-9]{0,12}([0-9][0-9,]{1,})',
+      caseSensitive: false,
+    );
+    final matches = totalPattern.allMatches(rawText).toList();
+    final amount = matches.isEmpty
+        ? null
+        : int.tryParse(matches.last.group(1)!.replaceAll(',', ''));
+    final dateMatch = RegExp(
+      r'(20\d{2})[./年-]\s*(\d{1,2})[./月-]\s*(\d{1,2})',
+    ).firstMatch(rawText);
+    DateTime? date;
+    if (dateMatch != null) {
+      date = DateTime(
+        int.parse(dateMatch.group(1)!),
+        int.parse(dateMatch.group(2)!),
+        int.parse(dateMatch.group(3)!),
+      );
+    }
+    return ReceiptDraft(
+      imagePath: imagePath,
+      merchant: merchant,
+      amount: amount,
+      date: date,
+    );
+  }
 }
 
 const categories = [
@@ -251,10 +311,18 @@ class _HomeShellState extends State<HomeShell> {
       )
       .toList();
 
-  Future<void> _openAdd({String? imagePath, bool fromScan = false}) async {
+  Future<void> _openAdd({
+    String? imagePath,
+    bool fromScan = false,
+    ReceiptDraft? draft,
+  }) async {
     final saved = await Navigator.of(context).push<Expense>(
       MaterialPageRoute(
-        builder: (_) => ExpenseEditor(imagePath: imagePath, fromScan: fromScan),
+        builder: (_) => ExpenseEditor(
+          imagePath: imagePath,
+          fromScan: fromScan,
+          draft: draft,
+        ),
       ),
     );
     if (saved != null) await widget.store.upsert(saved);
@@ -268,13 +336,13 @@ class _HomeShellState extends State<HomeShell> {
       maxWidth: 2048,
     );
     if (!mounted || photo == null) return;
-    final approvedPath = await Navigator.of(context).push<String>(
+    final draft = await Navigator.of(context).push<ReceiptDraft>(
       MaterialPageRoute(
         builder: (_) => ReceiptPreviewPage(imagePath: photo.path),
       ),
     );
-    if (!mounted || approvedPath == null) return;
-    await _openAdd(imagePath: approvedPath, fromScan: true);
+    if (!mounted || draft == null) return;
+    await _openAdd(imagePath: draft.imagePath, fromScan: true, draft: draft);
   }
 
   void _showAddSheet() {
@@ -1165,9 +1233,43 @@ class _AddOption extends StatelessWidget {
   );
 }
 
-class ReceiptPreviewPage extends StatelessWidget {
+class ReceiptPreviewPage extends StatefulWidget {
   const ReceiptPreviewPage({super.key, required this.imagePath});
   final String imagePath;
+
+  @override
+  State<ReceiptPreviewPage> createState() => _ReceiptPreviewPageState();
+}
+
+class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
+  var _isReading = false;
+  ReceiptDraft? _draft;
+  String? _error;
+
+  Future<void> _readReceipt() async {
+    setState(() {
+      _isReading = true;
+      _error = null;
+    });
+    final recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
+    try {
+      final result = await recognizer.processImage(
+        InputImage.fromFilePath(widget.imagePath),
+      );
+      if (!mounted) return;
+      setState(
+        () => _draft = ReceiptDraft.fromRecognizedText(
+          widget.imagePath,
+          result.text,
+        ),
+      );
+    } catch (_) {
+      if (mounted) setState(() => _error = '文字を読み取れませんでした。手入力で続けられます。');
+    } finally {
+      await recognizer.close();
+      if (mounted) setState(() => _isReading = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -1191,7 +1293,7 @@ class ReceiptPreviewPage extends StatelessWidget {
                     child: ColoredBox(
                       color: const Color(0xFFF0EEE7),
                       child: Image.file(
-                        File(imagePath),
+                        File(widget.imagePath),
                         fit: BoxFit.contain,
                         errorBuilder: (_, _, _) => const Center(
                           child: Column(
@@ -1218,18 +1320,50 @@ class ReceiptPreviewPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 5),
                 const Text(
-                  '保存するまで端末内の一時データです。内容はあとから手入力で確認・修正できます。',
+                  '写真は端末内で読み取れます。内容は保存前に必ず確認・修正できます。',
                   style: TextStyle(color: Color(0xFF6D777B), height: 1.45),
                 ),
+                if (_draft != null) ...[
+                  const SizedBox(height: 14),
+                  _OcrCandidateCard(draft: _draft!),
+                ],
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    _error!,
+                    style: const TextStyle(color: _coral, fontSize: 13),
+                  ),
+                ],
                 const SizedBox(height: 18),
                 FilledButton.icon(
-                  onPressed: () => Navigator.pop(context, imagePath),
-                  icon: const Icon(Icons.arrow_forward_rounded),
-                  label: const Text('この写真で入力を続ける'),
+                  onPressed: _isReading ? null : _readReceipt,
+                  icon: _isReading
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: _paper,
+                          ),
+                        )
+                      : const Icon(Icons.document_scanner_rounded),
+                  label: Text(_isReading ? '端末内で読み取り中…' : '写真から下書きを作る'),
                   style: FilledButton.styleFrom(
                     backgroundColor: _ink,
                     foregroundColor: _paper,
                     minimumSize: const Size.fromHeight(54),
+                  ),
+                ),
+                const SizedBox(height: 9),
+                OutlinedButton.icon(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _draft ?? ReceiptDraft(imagePath: widget.imagePath),
+                  ),
+                  icon: const Icon(Icons.edit_note_rounded),
+                  label: Text(_draft == null ? '手入力で続ける' : 'この内容で入力を続ける'),
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: const Size.fromHeight(50),
                   ),
                 ),
               ],
@@ -1237,6 +1371,38 @@ class ReceiptPreviewPage extends StatelessWidget {
           ),
         ),
       ),
+    ),
+  );
+}
+
+class _OcrCandidateCard extends StatelessWidget {
+  const _OcrCandidateCard({required this.draft});
+  final ReceiptDraft draft;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(13),
+    decoration: BoxDecoration(
+      color: const Color(0xFFE9EFE3),
+      borderRadius: BorderRadius.circular(16),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Row(
+          children: [
+            Icon(Icons.auto_awesome_rounded, size: 17, color: _sage),
+            SizedBox(width: 7),
+            Text('読み取り候補', style: TextStyle(fontWeight: FontWeight.w800)),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Text('お店: ${draft.merchant ?? '未検出'}'),
+        Text('金額: ${draft.amount == null ? '未検出' : _yen.format(draft.amount)}'),
+        Text(
+          '日付: ${draft.date == null ? '未検出' : _dateFormat.format(draft.date!)}',
+        ),
+      ],
     ),
   );
 }
@@ -1368,6 +1534,19 @@ class ExportPage extends StatelessWidget {
     return '# ${DateFormat('yyyy年M月').format(month)} のくらし帳\n\n- 支出合計: ${_yen.format(total)}\n- 月の予算: ${_yen.format(budget)}\n- のこり: ${_yen.format(budget - total)}\n\n## 記録\n\n| 日付 | お店・内容 | カテゴリ | 金額 |\n| --- | --- | --- | ---: |\n$rows\n';
   }
 
+  Future<void> _shareMarkdown(BuildContext context) async {
+    final directory = await getApplicationDocumentsDirectory();
+    final filename = 'household_${DateFormat('yyyy-MM').format(month)}.md';
+    final file = File('${directory.path}${Platform.pathSeparator}$filename');
+    await file.writeAsString(_markdown, encoding: utf8);
+    await SharePlus.instance.share(
+      ShareParams(
+        text: '${_monthFormat.format(month)}のくらし帳',
+        files: [XFile(file.path)],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Center(
@@ -1434,6 +1613,25 @@ class ExportPage extends StatelessWidget {
                         minimumSize: const Size.fromHeight(50),
                       ),
                     ),
+                    const SizedBox(height: 9),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        try {
+                          await _shareMarkdown(context);
+                        } catch (_) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('ファイルを書き出せませんでした')),
+                            );
+                          }
+                        }
+                      },
+                      icon: const Icon(Icons.ios_share_rounded),
+                      label: const Text('ファイルとして共有・保存'),
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size.fromHeight(50),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -1477,10 +1675,12 @@ class ExpenseEditor extends StatefulWidget {
     this.initial,
     this.imagePath,
     this.fromScan = false,
+    this.draft,
   });
   final Expense? initial;
   final String? imagePath;
   final bool fromScan;
+  final ReceiptDraft? draft;
   @override
   State<ExpenseEditor> createState() => _ExpenseEditorState();
 }
@@ -1496,12 +1696,15 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
   void initState() {
     super.initState();
     final value = widget.initial;
-    _merchant = TextEditingController(text: value?.merchant ?? '');
+    final draft = widget.draft;
+    _merchant = TextEditingController(
+      text: value?.merchant ?? draft?.merchant ?? '',
+    );
     _amount = TextEditingController(
-      text: value == null ? '' : value.amount.toString(),
+      text: value?.amount.toString() ?? draft?.amount?.toString() ?? '',
     );
     _note = TextEditingController(text: value?.note ?? '');
-    _date = value?.date ?? DateTime.now();
+    _date = value?.date ?? draft?.date ?? DateTime.now();
     _category = value?.category ?? 'food';
     _payment = value?.payment ?? '現金';
   }
