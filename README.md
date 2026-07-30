@@ -6,12 +6,17 @@
 
 - 支出の手動記録、編集、削除
 - カメラまたはギャラリーの画像を添えた記録
+- 端末内OCRによる店舗・日付・合計候補の読み取り
+- 対応端末でのGemini Nano（ML Kit Prompt API）による購入明細の整理
+- 商品・サービス明細ごとの数量、金額、カテゴリ編集
 - 月ごとの予算、残額、カテゴリ別の内訳
-- 履歴のキーワード検索とカテゴリ絞り込み
-- 月次記録をMarkdownとしてクリップボードへ出力
-- SharedPreferencesを使った端末内保存
+- 商品名を含む履歴検索とカテゴリ絞り込み
+- 月次記録と商品明細をMarkdownファイルとして共有・保存
+- Drift / SQLiteを正本とする端末内保存
 
-写真は手入力を補助するために添付でき、アプリから外部サーバーへ送信しません。端末内AIによるOCR/Gemini Nanoの自動抽出は、別途ネイティブ連携を追加する拡張ポイントとして残しています。
+写真、OCR文字列、家計データは独自サーバーへ送信しません。Gemini Nanoが非対応・未準備・解析失敗の場合も、OCR候補を引き継いだ手入力、閲覧、集計、出力は利用できます。旧バージョンのSharedPreferencesデータは初回起動時にSQLiteへ自動移行します。
+
+Gemini NanoはAndroidのAICoreとML Kit Prompt APIが利用可能な端末で動作します。設定画面で `AVAILABLE / DOWNLOADABLE / UNAVAILABLE` に対応した日本語表示を確認でき、必要な場合はモデルを準備できます。
 
 ## 起動
 
@@ -29,4 +34,4 @@ flutter build apk --debug
 subst R: /D
 ```
 
-生成済みのデバッグAPKは `build/app/outputs/flutter-apk/app-debug.apk` にあります。
+生成済みAPKは `build/app/outputs/flutter-apk/` にあります。配布版はGitHub Releasesからダウンロードできます。

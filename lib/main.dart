@@ -7,9 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
+
+import 'database.dart';
 
 const _ink = Color(0xFF23313D);
 const _paper = Color(0xFFFFFBF3);
@@ -28,6 +31,7 @@ final _dateFormat = DateFormat('M月d日 (E)', 'ja_JP');
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initializeDateFormatting('ja_JP');
   final store = await HouseholdStore.open();
   runApp(KurashiApp(store: store));
 }
@@ -71,6 +75,7 @@ class Expense {
     required this.payment,
     required this.source,
     this.imagePath,
+    this.items = const [],
   });
 
   final String id;
@@ -82,6 +87,17 @@ class Expense {
   final String payment;
   final String source;
   final String? imagePath;
+  final List<ExpenseItem> items;
+
+  int amountForCategory(String categoryId) {
+    if (items.isEmpty) return category == categoryId ? amount : 0;
+    final itemTotal = items.fold<int>(0, (sum, item) => sum + item.amount);
+    final categorized = items
+        .where((item) => item.category == categoryId)
+        .fold(0, (sum, item) => sum + item.amount);
+    final difference = amount - itemTotal;
+    return categorized + (category == categoryId ? difference : 0);
+  }
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -93,18 +109,71 @@ class Expense {
     'payment': payment,
     'source': source,
     'imagePath': imagePath,
+    'items': items.map((item) => item.toJson()).toList(),
   };
 
-  factory Expense.fromJson(Map<String, dynamic> json) => Expense(
+  factory Expense.fromJson(Map<String, dynamic> json) {
+    final rawItems = json['items'] as List<dynamic>? ?? const [];
+    final items = rawItems
+        .map((item) => ExpenseItem.fromJson(item as Map<String, dynamic>))
+        .toList();
+    if (items.isEmpty) {
+      items.add(
+        ExpenseItem(
+          id: '${json['id']}-0',
+          name: (json['merchant'] as String?)?.isNotEmpty == true
+              ? json['merchant'] as String
+              : '支出',
+          quantity: 1,
+          amount: json['amount'] as int,
+          category: json['category'] as String? ?? 'other',
+        ),
+      );
+    }
+    return Expense(
+      id: json['id'] as String,
+      merchant: json['merchant'] as String? ?? '',
+      amount: json['amount'] as int,
+      date: DateTime.parse(json['date'] as String),
+      category: json['category'] as String? ?? 'other',
+      note: json['note'] as String? ?? '',
+      payment: json['payment'] as String? ?? '現金',
+      source: json['source'] as String? ?? 'manual',
+      imagePath: json['imagePath'] as String?,
+      items: items,
+    );
+  }
+}
+
+class ExpenseItem {
+  const ExpenseItem({
+    required this.id,
+    required this.name,
+    required this.quantity,
+    required this.amount,
+    required this.category,
+  });
+
+  final String id;
+  final String name;
+  final int quantity;
+  final int amount;
+  final String category;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'quantity': quantity,
+    'amount': amount,
+    'category': category,
+  };
+
+  factory ExpenseItem.fromJson(Map<String, dynamic> json) => ExpenseItem(
     id: json['id'] as String,
-    merchant: json['merchant'] as String,
-    amount: json['amount'] as int,
-    date: DateTime.parse(json['date'] as String),
-    category: json['category'] as String,
-    note: json['note'] as String? ?? '',
-    payment: json['payment'] as String? ?? '現金',
-    source: json['source'] as String? ?? 'manual',
-    imagePath: json['imagePath'] as String?,
+    name: json['name'] as String? ?? '支出',
+    quantity: json['quantity'] as int? ?? 1,
+    amount: json['amount'] as int? ?? 0,
+    category: json['category'] as String? ?? 'other',
   );
 }
 
@@ -124,6 +193,11 @@ class ReceiptDraft {
     this.date,
     this.category = 'other',
     this.rawText = '',
+    this.payment,
+    this.items = const [],
+    this.confidence,
+    this.warnings = const [],
+    this.usedAi = false,
   });
 
   final String imagePath;
@@ -132,6 +206,64 @@ class ReceiptDraft {
   final DateTime? date;
   final String category;
   final String rawText;
+  final String? payment;
+  final List<ExpenseItem> items;
+  final double? confidence;
+  final List<String> warnings;
+  final bool usedAi;
+
+  ReceiptDraft withNanoResponse(String response) {
+    var source = response.trim();
+    if (source.startsWith('```')) {
+      source = source
+          .replaceFirst(RegExp(r'^```(?:json)?\s*'), '')
+          .replaceFirst(RegExp(r'\s*```$'), '');
+    }
+    final value = jsonDecode(source) as Map<String, dynamic>;
+    final rawCategories = categories.map((category) => category.id).toSet();
+    final rawItems = value['items'] as List<dynamic>? ?? const [];
+    final parsedItems = <ExpenseItem>[];
+    for (var index = 0; index < rawItems.length; index++) {
+      final item = rawItems[index] as Map<String, dynamic>;
+      final amount = (item['amount'] as num?)?.toInt() ?? 0;
+      if (amount < 0) continue;
+      final rawCategory = item['categoryCode'] as String? ?? 'other';
+      parsedItems.add(
+        ExpenseItem(
+          id: '${DateTime.now().microsecondsSinceEpoch}-$index',
+          name: (item['name'] as String?)?.trim().isNotEmpty == true
+              ? (item['name'] as String).trim()
+              : '不明な商品',
+          quantity: max(1, (item['quantity'] as num?)?.toInt() ?? 1),
+          amount: amount,
+          category: rawCategories.contains(rawCategory) ? rawCategory : 'other',
+        ),
+      );
+    }
+    DateTime? parsedDate;
+    final purchasedAt = value['purchasedAt'] as String?;
+    if (purchasedAt != null) parsedDate = DateTime.tryParse(purchasedAt);
+    final total = (value['totalAmount'] as num?)?.toInt();
+    final confidenceValue = (value['confidence'] as num?)?.toDouble();
+    final aiWarnings = (value['warnings'] as List<dynamic>? ?? const [])
+        .map((warning) => warning.toString())
+        .toList();
+    return ReceiptDraft(
+      imagePath: imagePath,
+      merchant: (value['merchant'] as String?)?.trim().isNotEmpty == true
+          ? (value['merchant'] as String).trim()
+          : merchant,
+      amount: total != null && total > 0 ? total : amount,
+      date: parsedDate ?? date,
+      category: parsedItems.isNotEmpty ? parsedItems.first.category : category,
+      rawText: rawText,
+      payment: (value['paymentMethod'] as String?)?.trim(),
+      items: parsedItems,
+      confidence: confidenceValue?.clamp(0, 1),
+      warnings: aiWarnings,
+      usedAi: true,
+    );
+  }
 
   factory ReceiptDraft.fromRecognizedText(String imagePath, String rawText) {
     final lines = rawText
@@ -195,6 +327,51 @@ class ReceiptDraft {
   }
 }
 
+class NanoGateway {
+  static const _channel = MethodChannel('com.miki.householdai/gemini_nano');
+
+  static Future<String> checkStatus() async {
+    if (!Platform.isAndroid) return 'UNAVAILABLE';
+    try {
+      return await _channel.invokeMethod<String>('checkStatus') ?? 'ERROR';
+    } on PlatformException {
+      return 'ERROR';
+    } on MissingPluginException {
+      return 'UNAVAILABLE';
+    }
+  }
+
+  static Future<String> downloadModel() async {
+    if (!Platform.isAndroid) return 'UNAVAILABLE';
+    try {
+      return await _channel.invokeMethod<String>('downloadModel') ?? 'ERROR';
+    } on PlatformException {
+      return 'ERROR';
+    }
+  }
+
+  static Future<String> analyze({
+    required String imagePath,
+    required String ocrText,
+  }) async {
+    final categoryList = categories
+        .map((category) => '${category.id}: ${category.name}')
+        .join(', ');
+    final response = await _channel
+        .invokeMethod<String>('analyzeReceipt', {
+          'imagePath': imagePath,
+          'ocrText': ocrText,
+          'categories': categoryList,
+          'currentDateTime': DateTime.now().toIso8601String(),
+        })
+        .timeout(const Duration(seconds: 120));
+    if (response == null || response.trim().isEmpty) {
+      throw const FormatException('Gemini Nano returned an empty response');
+    }
+    return response;
+  }
+}
+
 const categories = [
   BudgetCategory('food', '食費', Icons.restaurant_rounded, Color(0xFFCD765C)),
   BudgetCategory('daily', '日用品', Icons.shopping_bag_rounded, Color(0xFF72866F)),
@@ -220,50 +397,79 @@ BudgetCategory categoryOf(String id) => categories.firstWhere(
 );
 
 class HouseholdStore extends ChangeNotifier {
-  HouseholdStore._(this._prefs, this.expenses, this.budget);
+  HouseholdStore._(this._prefs, this._database, this.expenses, this._budgets);
   final SharedPreferences _prefs;
+  final AppDatabase _database;
   List<Expense> expenses;
-  int budget;
+  Map<String, int> _budgets;
+
+  String _monthKey(DateTime month) =>
+      '${month.year}-${month.month.toString().padLeft(2, '0')}';
+
+  int budgetFor(DateTime month) => _budgets[_monthKey(month)] ?? 100000;
 
   static Future<HouseholdStore> open() async {
     final prefs = await SharedPreferences.getInstance();
+    final database = AppDatabase();
     final raw = prefs.getString('expenses_v1');
-    final expenses = raw == null
-        ? <Expense>[]
-        : (jsonDecode(raw) as List<dynamic>)
-              .map((value) => Expense.fromJson(value as Map<String, dynamic>))
-              .toList();
-    return HouseholdStore._(
-      prefs,
-      expenses,
-      prefs.getInt('monthly_budget_v1') ?? 100000,
-    );
+    var expenses = (await database.loadExpenses())
+        .map(Expense.fromJson)
+        .toList();
+    if (expenses.isEmpty && raw != null) {
+      expenses = (jsonDecode(raw) as List<dynamic>)
+          .map((value) => Expense.fromJson(value as Map<String, dynamic>))
+          .toList();
+      for (final expense in expenses) {
+        await database.replaceExpense(expense.toJson());
+      }
+    }
+    final budgets = await database.loadBudgets();
+    final currentMonth = DateTime.now();
+    final currentKey =
+        '${currentMonth.year}-${currentMonth.month.toString().padLeft(2, '0')}';
+    if (!budgets.containsKey(currentKey)) {
+      final migrated =
+          budgets['default'] ?? prefs.getInt('monthly_budget_v1') ?? 100000;
+      budgets[currentKey] = migrated;
+      await database.saveBudget(currentKey, migrated);
+    }
+    return HouseholdStore._(prefs, database, expenses, budgets);
   }
 
   Future<void> upsert(Expense value) async {
     final saved = await _copyImageToAppStorage(value);
     expenses = [...expenses.where((expense) => expense.id != saved.id), saved]
       ..sort((a, b) => b.date.compareTo(a.date));
-    await _persist();
+    await _database.replaceExpense(saved.toJson());
     notifyListeners();
   }
 
   Future<void> remove(String id) async {
+    final removed = expenses.where((expense) => expense.id == id).firstOrNull;
     expenses = expenses.where((expense) => expense.id != id).toList();
-    await _persist();
+    await _database.removeExpense(id);
+    final imagePath = removed?.imagePath;
+    if (imagePath != null &&
+        !expenses.any((expense) => expense.imagePath == imagePath)) {
+      final image = File(imagePath);
+      if (await image.exists()) {
+        try {
+          await image.delete();
+        } on FileSystemException {
+          // The financial record is deleted even if Android still holds the file.
+        }
+      }
+    }
     notifyListeners();
   }
 
-  Future<void> setBudget(int value) async {
-    budget = value;
+  Future<void> setBudget(DateTime month, int value) async {
+    final key = _monthKey(month);
+    _budgets = {..._budgets, key: value};
     await _prefs.setInt('monthly_budget_v1', value);
+    await _database.saveBudget(key, value);
     notifyListeners();
   }
-
-  Future<void> _persist() => _prefs.setString(
-    'expenses_v1',
-    jsonEncode(expenses.map((expense) => expense.toJson()).toList()),
-  );
 
   Future<Expense> _copyImageToAppStorage(Expense value) async {
     final sourcePath = value.imagePath;
@@ -294,6 +500,7 @@ class HouseholdStore extends ChangeNotifier {
       payment: value.payment,
       source: value.source,
       imagePath: copied.path,
+      items: value.items,
     );
   }
 }
@@ -432,7 +639,7 @@ class _HomeShellState extends State<HomeShell> {
       DashboardPage(
         month: _month,
         expenses: _monthly,
-        budget: widget.store.budget,
+        budget: widget.store.budgetFor(_month),
         onPrevious: () =>
             setState(() => _month = DateTime(_month.year, _month.month - 1)),
         onNext: () =>
@@ -442,8 +649,8 @@ class _HomeShellState extends State<HomeShell> {
         onSettings: () => Navigator.of(context).push(
           MaterialPageRoute(
             builder: (_) => BudgetSettingsPage(
-              budget: widget.store.budget,
-              onSave: widget.store.setBudget,
+              budget: widget.store.budgetFor(_month),
+              onSave: (value) => widget.store.setBudget(_month, value),
             ),
           ),
         ),
@@ -453,7 +660,9 @@ class _HomeShellState extends State<HomeShell> {
               month: _month,
               category: categoryOf(categoryId),
               expenses: _monthly
-                  .where((expense) => expense.category == categoryId)
+                  .where(
+                    (expense) => expense.amountForCategory(categoryId) != 0,
+                  )
                   .toList(),
               onExpense: _showDetail,
             ),
@@ -464,7 +673,7 @@ class _HomeShellState extends State<HomeShell> {
       ExportPage(
         month: _month,
         expenses: _monthly,
-        budget: widget.store.budget,
+        budget: widget.store.budgetFor(_month),
       ),
     ];
     return Scaffold(
@@ -551,11 +760,15 @@ class DashboardPage extends StatelessWidget {
     final remaining = budget - total;
     final breakdown = <String, int>{};
     for (final expense in expenses) {
-      breakdown.update(
-        expense.category,
-        (amount) => amount + expense.amount,
-        ifAbsent: () => expense.amount,
-      );
+      for (final category in categories) {
+        final amount = expense.amountForCategory(category.id);
+        if (amount == 0) continue;
+        breakdown.update(
+          category.id,
+          (current) => current + amount,
+          ifAbsent: () => amount,
+        );
+      }
     }
     return Center(
       child: ConstrainedBox(
@@ -966,7 +1179,32 @@ class CategoryDetailPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final total = expenses.fold<int>(0, (sum, expense) => sum + expense.amount);
+    final lines = <_CategoryLine>[];
+    for (final expense in expenses) {
+      for (final item in expense.items.where(
+        (item) => item.category == category.id,
+      )) {
+        lines.add(
+          _CategoryLine(expense: expense, name: item.name, amount: item.amount),
+        );
+      }
+      final itemTotal = expense.items.fold<int>(
+        0,
+        (sum, item) => sum + item.amount,
+      );
+      final difference = expense.amount - itemTotal;
+      if (expense.category == category.id && difference != 0) {
+        lines.add(
+          _CategoryLine(
+            expense: expense,
+            name: expense.items.isEmpty ? '支出合計' : '差額（税・値引き等）',
+            amount: difference,
+          ),
+        );
+      }
+    }
+    lines.sort((a, b) => b.expense.date.compareTo(a.expense.date));
+    final total = lines.fold<int>(0, (sum, line) => sum + line.amount);
     return Scaffold(
       backgroundColor: _paper,
       appBar: AppBar(backgroundColor: _paper, elevation: 0),
@@ -994,19 +1232,20 @@ class CategoryDetailPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  '${expenses.length}件の記録 ・ ${_yen.format(total)}',
+                  '${lines.length}件の明細 ・ ${_yen.format(total)}',
                   style: const TextStyle(color: Color(0xFF6D777B)),
                 ),
                 const SizedBox(height: 18),
                 Expanded(
-                  child: expenses.isEmpty
+                  child: lines.isEmpty
                       ? const Center(child: Text('このカテゴリの記録はありません'))
                       : ListView(
-                          children: expenses
+                          children: lines
                               .map(
-                                (expense) => _ExpenseTile(
-                                  expense: expense,
-                                  onTap: () => onExpense(expense),
+                                (line) => _CategoryLineTile(
+                                  line: line,
+                                  category: category,
+                                  onTap: () => onExpense(line.expense),
                                 ),
                               )
                               .toList(),
@@ -1019,6 +1258,57 @@ class CategoryDetailPage extends StatelessWidget {
       ),
     );
   }
+}
+
+class _CategoryLine {
+  const _CategoryLine({
+    required this.expense,
+    required this.name,
+    required this.amount,
+  });
+
+  final Expense expense;
+  final String name;
+  final int amount;
+}
+
+class _CategoryLineTile extends StatelessWidget {
+  const _CategoryLineTile({
+    required this.line,
+    required this.category,
+    required this.onTap,
+  });
+
+  final _CategoryLine line;
+  final BudgetCategory category;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    elevation: 0,
+    color: const Color(0xFFFFFDF8),
+    margin: const EdgeInsets.only(bottom: 9),
+    child: ListTile(
+      onTap: onTap,
+      leading: CircleAvatar(
+        backgroundColor: category.color.withValues(alpha: .13),
+        foregroundColor: category.color,
+        child: Icon(category.icon, size: 19),
+      ),
+      title: Text(
+        line.name,
+        style: const TextStyle(fontWeight: FontWeight.w800),
+      ),
+      subtitle: Text(
+        '${_dateFormat.format(line.expense.date)} ・ '
+        '${line.expense.merchant.isEmpty ? '名前のない記録' : line.expense.merchant}',
+      ),
+      trailing: Text(
+        _yen.format(line.amount),
+        style: const TextStyle(fontWeight: FontWeight.w800),
+      ),
+    ),
+  );
 }
 
 class BudgetSettingsPage extends StatefulWidget {
@@ -1037,11 +1327,14 @@ class BudgetSettingsPage extends StatefulWidget {
 
 class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
   late final TextEditingController _budget;
+  String _aiStatus = 'CHECKING';
+  bool _checkingAi = false;
 
   @override
   void initState() {
     super.initState();
     _budget = TextEditingController(text: widget.budget.toString());
+    _refreshAiStatus();
   }
 
   @override
@@ -1061,6 +1354,38 @@ class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
     await widget.onSave(value);
     if (mounted) Navigator.pop(context);
   }
+
+  Future<void> _refreshAiStatus() async {
+    setState(() => _checkingAi = true);
+    final status = await NanoGateway.checkStatus();
+    if (!mounted) return;
+    setState(() {
+      _aiStatus = status;
+      _checkingAi = false;
+    });
+  }
+
+  Future<void> _downloadAi() async {
+    setState(() {
+      _aiStatus = 'DOWNLOADING';
+      _checkingAi = true;
+    });
+    final status = await NanoGateway.downloadModel();
+    if (!mounted) return;
+    setState(() {
+      _aiStatus = status;
+      _checkingAi = false;
+    });
+  }
+
+  String get _aiLabel => switch (_aiStatus) {
+    'AVAILABLE' => 'Gemini Nano：利用できます',
+    'DOWNLOADABLE' => 'Gemini Nano：ダウンロードできます',
+    'DOWNLOADING' => 'Gemini Nano：準備中',
+    'UNAVAILABLE' => 'Gemini Nano：この端末では非対応',
+    'ERROR' => 'Gemini Nano：状態を確認できません',
+    _ => 'Gemini Nano：確認中',
+  };
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -1101,7 +1426,64 @@ class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
                 children: [
                   _InfoLine(Icons.lock_outline_rounded, '記録はこの端末に保存'),
                   _InfoLine(Icons.image_outlined, '添付画像は外部へ送信しない'),
-                  _InfoLine(Icons.auto_awesome_outlined, '端末内AIによる解析は準備中'),
+                  _InfoLine(Icons.auto_awesome_outlined, 'レシート文字は端末内で読み取り'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 28),
+            const Text(
+              '端末内AI',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(17),
+              decoration: _cardDecoration,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.memory_rounded, color: _sage),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          _aiLabel,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                      if (_checkingAi)
+                        const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '対応端末では画像と文字を外部送信せずに解析します。非対応でもOCRと手入力は利用できます。',
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.45,
+                      color: Color(0xFF6D777B),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      if (_aiStatus == 'DOWNLOADABLE')
+                        FilledButton.tonal(
+                          onPressed: _checkingAi ? null : _downloadAi,
+                          child: const Text('モデルを準備する'),
+                        ),
+                      const Spacer(),
+                      TextButton(
+                        onPressed: _checkingAi ? null : _refreshAiStatus,
+                        child: const Text('再確認'),
+                      ),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -1266,6 +1648,7 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
   var _isReading = false;
   ReceiptDraft? _draft;
   String? _error;
+  String _nanoStatus = 'CHECKING';
 
   @override
   void initState() {
@@ -1282,16 +1665,43 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
     TextRecognizer? recognizer;
     try {
       recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
-      final result = await recognizer.processImage(
-        InputImage.fromFilePath(widget.imagePath),
-      );
+      final result = await recognizer
+          .processImage(InputImage.fromFilePath(widget.imagePath))
+          .timeout(const Duration(seconds: 15));
       if (!mounted) return;
+      final ocrDraft = ReceiptDraft.fromRecognizedText(
+        widget.imagePath,
+        result.text,
+      );
       setState(() {
-        _draft = ReceiptDraft.fromRecognizedText(widget.imagePath, result.text);
+        _draft = ocrDraft;
         if (result.text.trim().isEmpty) {
           _error = '文字を検出できませんでした。明るい場所で、文字が正面に写るよう撮影してください。';
         }
       });
+      final status = await NanoGateway.checkStatus();
+      if (!mounted) return;
+      setState(() => _nanoStatus = status);
+      if (status == 'AVAILABLE' && result.text.trim().isNotEmpty) {
+        setState(() => _nanoStatus = 'ANALYZING');
+        try {
+          final response = await NanoGateway.analyze(
+            imagePath: widget.imagePath,
+            ocrText: result.text,
+          );
+          if (!mounted) return;
+          setState(() {
+            _draft = ocrDraft.withNanoResponse(response);
+            _nanoStatus = 'AVAILABLE';
+          });
+        } catch (_) {
+          if (!mounted) return;
+          setState(() {
+            _nanoStatus = 'ERROR';
+            _error = '端末内AIで内容を整理できませんでした。文字の読み取り候補を使って手入力できます。';
+          });
+        }
+      }
     } catch (_) {
       if (mounted) {
         setState(() => _error = '文字を読み取れませんでした。写真は添えたまま手入力で続けられます。');
@@ -1301,6 +1711,29 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
       if (mounted) setState(() => _isReading = false);
     }
   }
+
+  Future<void> _downloadNano() async {
+    setState(() => _nanoStatus = 'DOWNLOADING');
+    final result = await NanoGateway.downloadModel();
+    if (!mounted) return;
+    setState(() => _nanoStatus = result);
+    if (result == 'AVAILABLE') {
+      await _readReceipt();
+    } else if (mounted) {
+      setState(() => _error = '端末内AIを準備できませんでした。手入力はそのまま利用できます。');
+    }
+  }
+
+  String get _nanoMessage => switch (_nanoStatus) {
+    'AVAILABLE' =>
+      _draft?.usedAi == true ? '端末内AIで内容を整理しました' : 'この端末ではGemini Nanoを利用できます',
+    'ANALYZING' => '端末内AIで購入内容を整理しています…',
+    'DOWNLOADABLE' => '端末内AIを追加で準備できます',
+    'DOWNLOADING' => '端末内AIをダウンロードしています…',
+    'UNAVAILABLE' => 'この端末ではOCR候補と手入力を利用します',
+    'ERROR' => '端末内AIは利用できません。OCR候補は使用できます',
+    _ => '端末内AIの状態を確認しています…',
+  };
 
   @override
   Widget build(BuildContext context) => Scaffold(
@@ -1382,6 +1815,40 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                   const SizedBox(height: 14),
                   _OcrCandidateCard(draft: _draft!),
                 ],
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 13,
+                    vertical: 11,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF4F1E9),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _draft?.usedAi == true
+                            ? Icons.auto_awesome_rounded
+                            : Icons.memory_rounded,
+                        size: 19,
+                        color: _sage,
+                      ),
+                      const SizedBox(width: 9),
+                      Expanded(
+                        child: Text(
+                          _nanoMessage,
+                          style: const TextStyle(fontSize: 12.5),
+                        ),
+                      ),
+                      if (_nanoStatus == 'DOWNLOADABLE')
+                        TextButton(
+                          onPressed: _downloadNano,
+                          child: const Text('準備する'),
+                        ),
+                    ],
+                  ),
+                ),
                 if (_error != null) ...[
                   const SizedBox(height: 12),
                   Text(
@@ -1411,14 +1878,12 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                 ),
                 const SizedBox(height: 9),
                 OutlinedButton.icon(
-                  onPressed: _isReading
-                      ? null
-                      : () => Navigator.pop(
-                          context,
-                          _draft ?? ReceiptDraft(imagePath: widget.imagePath),
-                        ),
+                  onPressed: () => Navigator.pop(
+                    context,
+                    _draft ?? ReceiptDraft(imagePath: widget.imagePath),
+                  ),
                   icon: const Icon(Icons.edit_note_rounded),
-                  label: Text(_draft == null ? '手入力で続ける' : 'この内容で入力を続ける'),
+                  label: Text(_draft == null ? '写真を添えて手入力へ' : '候補を確認・修正する'),
                   style: OutlinedButton.styleFrom(
                     minimumSize: const Size.fromHeight(50),
                   ),
@@ -1459,6 +1924,21 @@ class _OcrCandidateCard extends StatelessWidget {
         Text(
           '日付: ${draft.date == null ? '未検出' : _dateFormat.format(draft.date!)}',
         ),
+        if (draft.payment?.isNotEmpty == true) Text('支払い: ${draft.payment}'),
+        if (draft.items.isNotEmpty)
+          Text(
+            '明細: ${draft.items.length}件（${draft.items.map((item) => item.name).take(3).join('、')}）',
+          ),
+        if (draft.confidence != null)
+          Text('読み取り信頼度: ${(draft.confidence! * 100).round()}%'),
+        if (draft.warnings.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 5),
+            child: Text(
+              draft.warnings.join(' / '),
+              style: const TextStyle(fontSize: 12, color: _coral),
+            ),
+          ),
         const SizedBox(height: 10),
         const Text(
           '読み取った文字',
@@ -1510,10 +1990,10 @@ class _HistoryPageState extends State<HistoryPage> {
     final items = widget.expenses
         .where(
           (expense) =>
-              (_filter == 'all' || expense.category == _filter) &&
-              ('${expense.merchant} ${expense.note}'.toLowerCase().contains(
-                _query.toLowerCase(),
-              )),
+              (_filter == 'all' || expense.amountForCategory(_filter) != 0) &&
+              ('${expense.merchant} ${expense.note} ${expense.items.map((item) => item.name).join(' ')}'
+                  .toLowerCase()
+                  .contains(_query.toLowerCase())),
         )
         .toList();
     return Center(
@@ -1537,7 +2017,7 @@ class _HistoryPageState extends State<HistoryPage> {
               TextField(
                 onChanged: (value) => setState(() => _query = value),
                 decoration: InputDecoration(
-                  hintText: 'お店・メモを検索',
+                  hintText: 'お店・商品・メモを検索',
                   prefixIcon: const Icon(Icons.search_rounded),
                   filled: true,
                   fillColor: const Color(0xFFFFFDF8),
@@ -1608,14 +2088,41 @@ class ExportPage extends StatelessWidget {
   final int budget;
   String get _markdown {
     final total = expenses.fold<int>(0, (sum, expense) => sum + expense.amount);
-    final rows = expenses
+    final purchaseRows = expenses
         .map(
-          (e) =>
-              '| ${DateFormat('M/d').format(e.date)} | ${e.merchant.isEmpty ? '—' : e.merchant} | ${categoryOf(e.category).name} | ${_yen.format(e.amount)} |',
+          (expense) =>
+              '| ${DateFormat('M/d').format(expense.date)} | ${_markdownCell(expense.merchant.isEmpty ? '—' : expense.merchant)} | ${categoryOf(expense.category).name} | ${_markdownCell(expense.payment)} | ${_markdownCell(expense.note.isEmpty ? '—' : expense.note)} | ${_yen.format(expense.amount)} |',
         )
         .join('\n');
-    return '# ${DateFormat('yyyy年M月').format(month)} のくらし帳\n\n- 支出合計: ${_yen.format(total)}\n- 月の予算: ${_yen.format(budget)}\n- のこり: ${_yen.format(budget - total)}\n\n## 記録\n\n| 日付 | お店・内容 | カテゴリ | 金額 |\n| --- | --- | --- | ---: |\n$rows\n';
+    final categoryRows = categories
+        .map(
+          (category) => MapEntry(
+            category,
+            expenses.fold<int>(
+              0,
+              (sum, expense) => sum + expense.amountForCategory(category.id),
+            ),
+          ),
+        )
+        .where((entry) => entry.value != 0)
+        .map(
+          (entry) =>
+              '| ${entry.key.name} | ${_yen.format(entry.value)} | ${(entry.value / max(total, 1) * 100).toStringAsFixed(1)}% |',
+        )
+        .join('\n');
+    final itemRows = expenses
+        .expand((expense) {
+          return expense.items.map(
+            (item) =>
+                '| ${DateFormat('M/d').format(expense.date)} | ${_markdownCell(expense.merchant.isEmpty ? '—' : expense.merchant)} | ${_markdownCell(item.name)} | ${item.quantity} | ${categoryOf(item.category).name} | ${_yen.format(item.amount)} |',
+          );
+        })
+        .join('\n');
+    return '# ${DateFormat('yyyy年M月').format(month)} のくらし帳\n\n- 支出合計: ${_yen.format(total)}\n- 月の予算: ${_yen.format(budget)}\n- のこり: ${_yen.format(budget - total)}\n\n## カテゴリ別\n\n| カテゴリ | 金額 | 割合 |\n| --- | ---: | ---: |\n$categoryRows\n\n## 記録\n\n| 日付 | お店・内容 | 主カテゴリ | 支払方法 | メモ | 合計 |\n| --- | --- | --- | --- | --- | ---: |\n$purchaseRows\n\n## 商品・明細\n\n| 日付 | お店 | 商品・内容 | 数量 | カテゴリ | 金額 |\n| --- | --- | --- | ---: | --- | ---: |\n$itemRows\n';
   }
+
+  String _markdownCell(String value) =>
+      value.replaceAll('|', r'\|').replaceAll('\n', ' ');
 
   Future<void> _shareMarkdown(BuildContext context) async {
     final directory = await getApplicationDocumentsDirectory();
@@ -1775,6 +2282,10 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
   late DateTime _date;
   late String _category;
   late String _payment;
+  late List<ExpenseItem> _items;
+
+  int get _itemTotal => _items.fold<int>(0, (sum, item) => sum + item.amount);
+
   @override
   void initState() {
     super.initState();
@@ -1789,7 +2300,19 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
     _note = TextEditingController(text: value?.note ?? '');
     _date = value?.date ?? draft?.date ?? DateTime.now();
     _category = value?.category ?? draft?.category ?? 'other';
-    _payment = value?.payment ?? '現金';
+    _payment = value?.payment ?? draft?.payment ?? '現金';
+    _items = [...?value?.items, ...?draft?.items];
+    if (_items.isEmpty && draft?.amount != null) {
+      _items.add(
+        ExpenseItem(
+          id: '${DateTime.now().microsecondsSinceEpoch}-item',
+          name: draft?.merchant?.isNotEmpty == true ? draft!.merchant! : '購入品',
+          quantity: 1,
+          amount: draft!.amount!,
+          category: _category,
+        ),
+      );
+    }
   }
 
   @override
@@ -1808,10 +2331,25 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
       ).showSnackBar(const SnackBar(content: Text('金額を1円以上で入力してください')));
       return;
     }
+    final expenseId =
+        widget.initial?.id ?? '${DateTime.now().microsecondsSinceEpoch}';
+    final items = _items.isEmpty
+        ? [
+            ExpenseItem(
+              id: '$expenseId-item-0',
+              name: _merchant.text.trim().isEmpty
+                  ? '支出'
+                  : _merchant.text.trim(),
+              quantity: 1,
+              amount: amount,
+              category: _category,
+            ),
+          ]
+        : List<ExpenseItem>.unmodifiable(_items);
     Navigator.pop(
       context,
       Expense(
-        id: widget.initial?.id ?? '${DateTime.now().microsecondsSinceEpoch}',
+        id: expenseId,
         merchant: _merchant.text.trim(),
         amount: amount,
         date: _date,
@@ -1820,8 +2358,37 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
         payment: _payment,
         source: widget.fromScan ? 'image' : 'manual',
         imagePath: widget.imagePath ?? widget.initial?.imagePath,
+        items: items,
       ),
     );
+  }
+
+  Future<void> _editItem([ExpenseItem? item]) async {
+    final edited = await showDialog<ExpenseItem>(
+      context: context,
+      builder: (_) => ExpenseItemDialog(
+        initial: item,
+        defaultCategory: item?.category ?? _category,
+      ),
+    );
+    if (edited == null) return;
+    setState(() {
+      final index = _items.indexWhere((value) => value.id == edited.id);
+      if (index < 0) {
+        _items.add(edited);
+      } else {
+        _items[index] = edited;
+      }
+      if (_items.length == 1) _category = edited.category;
+      _amount.text = _itemTotal.toString();
+    });
+  }
+
+  void _removeItem(ExpenseItem item) {
+    setState(() {
+      _items.removeWhere((value) => value.id == item.id);
+      if (_items.isNotEmpty) _amount.text = _itemTotal.toString();
+    });
   }
 
   @override
@@ -1889,6 +2456,7 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
                   hint: '例）1280',
                   keyboard: TextInputType.number,
                   prefix: '¥',
+                  onChanged: (_) => setState(() {}),
                 ),
                 const SizedBox(height: 17),
                 const Text(
@@ -1921,6 +2489,154 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
                         ),
                       )
                       .toList(),
+                ),
+                const SizedBox(height: 20),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: _cardDecoration,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '商品・明細',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  '品目ごとにカテゴリを分けられます',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Color(0xFF6D777B),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: _editItem,
+                            icon: const Icon(Icons.add_rounded, size: 19),
+                            label: const Text('追加'),
+                          ),
+                        ],
+                      ),
+                      if (_items.isEmpty)
+                        Container(
+                          width: double.infinity,
+                          margin: const EdgeInsets.only(top: 12),
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF4F1E9),
+                            borderRadius: BorderRadius.circular(13),
+                          ),
+                          child: const Text(
+                            '明細はまだありません。追加しなくても合計金額で記録できます。',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFF687174),
+                            ),
+                          ),
+                        )
+                      else ...[
+                        const SizedBox(height: 8),
+                        ..._items.map(
+                          (item) => Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: CircleAvatar(
+                                backgroundColor: categoryOf(
+                                  item.category,
+                                ).color.withValues(alpha: .13),
+                                foregroundColor: categoryOf(
+                                  item.category,
+                                ).color,
+                                child: Icon(
+                                  categoryOf(item.category).icon,
+                                  size: 19,
+                                ),
+                              ),
+                              title: Text(
+                                item.name,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              subtitle: Text(
+                                '${categoryOf(item.category).name} ・ ${item.quantity}点',
+                              ),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    _yen.format(item.amount),
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                  PopupMenuButton<String>(
+                                    onSelected: (action) {
+                                      if (action == 'edit') {
+                                        _editItem(item);
+                                      } else {
+                                        _removeItem(item);
+                                      }
+                                    },
+                                    itemBuilder: (_) => const [
+                                      PopupMenuItem(
+                                        value: 'edit',
+                                        child: Text('編集'),
+                                      ),
+                                      PopupMenuItem(
+                                        value: 'delete',
+                                        child: Text('削除'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                              onTap: () => _editItem(item),
+                            ),
+                          ),
+                        ),
+                        const Divider(height: 18),
+                        Row(
+                          children: [
+                            const Text(
+                              '明細の合計',
+                              style: TextStyle(color: Color(0xFF6D777B)),
+                            ),
+                            const Spacer(),
+                            Text(
+                              _yen.format(_itemTotal),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (int.tryParse(_amount.text.replaceAll(',', '')) !=
+                            _itemTotal)
+                          const Padding(
+                            padding: EdgeInsets.only(top: 8),
+                            child: Text(
+                              '合計金額との差額は、上で選んだ主カテゴリに集計されます。',
+                              style: TextStyle(fontSize: 11, color: _coral),
+                            ),
+                          ),
+                      ],
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 20),
                 ListTile(
@@ -1990,6 +2706,7 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
     String? hint,
     TextInputType? keyboard,
     String? prefix,
+    ValueChanged<String>? onChanged,
   }) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
@@ -1998,8 +2715,154 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
       TextField(
         controller: controller,
         keyboardType: keyboard,
+        onChanged: onChanged,
         decoration: _inputDecoration(hint: hint, prefix: prefix),
       ),
+    ],
+  );
+}
+
+class ExpenseItemDialog extends StatefulWidget {
+  const ExpenseItemDialog({
+    super.key,
+    this.initial,
+    required this.defaultCategory,
+  });
+
+  final ExpenseItem? initial;
+  final String defaultCategory;
+
+  @override
+  State<ExpenseItemDialog> createState() => _ExpenseItemDialogState();
+}
+
+class _ExpenseItemDialogState extends State<ExpenseItemDialog> {
+  late final TextEditingController _name;
+  late final TextEditingController _quantity;
+  late final TextEditingController _amount;
+  late String _category;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: widget.initial?.name ?? '');
+    _quantity = TextEditingController(
+      text: (widget.initial?.quantity ?? 1).toString(),
+    );
+    _amount = TextEditingController(
+      text: widget.initial?.amount.toString() ?? '',
+    );
+    _category = widget.initial?.category ?? widget.defaultCategory;
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _quantity.dispose();
+    _amount.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final quantity = int.tryParse(_quantity.text);
+    final amount = int.tryParse(_amount.text.replaceAll(',', ''));
+    if (_name.text.trim().isEmpty ||
+        quantity == null ||
+        quantity <= 0 ||
+        amount == null ||
+        amount <= 0) {
+      setState(() => _error = '商品名・数量・金額を正しく入力してください。');
+      return;
+    }
+    Navigator.pop(
+      context,
+      ExpenseItem(
+        id:
+            widget.initial?.id ??
+            '${DateTime.now().microsecondsSinceEpoch}-item',
+        name: _name.text.trim(),
+        quantity: quantity,
+        amount: amount,
+        category: _category,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.initial == null ? '明細を追加' : '明細を編集'),
+    content: SingleChildScrollView(
+      child: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _name,
+              autofocus: true,
+              textInputAction: TextInputAction.next,
+              decoration: _inputDecoration(hint: '商品・サービス名'),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _quantity,
+                    keyboardType: TextInputType.number,
+                    decoration: _inputDecoration(hint: '数量'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: TextField(
+                    controller: _amount,
+                    keyboardType: TextInputType.number,
+                    decoration: _inputDecoration(hint: '明細の合計', prefix: '¥'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _category,
+              decoration: _inputDecoration(),
+              items: categories
+                  .map(
+                    (category) => DropdownMenuItem(
+                      value: category.id,
+                      child: Row(
+                        children: [
+                          Icon(category.icon, size: 18, color: category.color),
+                          const SizedBox(width: 8),
+                          Text(category.name),
+                        ],
+                      ),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (value) => setState(() => _category = value!),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 10),
+              Text(
+                _error!,
+                style: const TextStyle(fontSize: 12, color: _coral),
+              ),
+            ],
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('キャンセル'),
+      ),
+      FilledButton(onPressed: _submit, child: const Text('反映する')),
     ],
   );
 }
@@ -2099,108 +2962,144 @@ class ExpenseDetail extends StatelessWidget {
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 600),
-          child: Padding(
+          child: ListView(
             padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  width: 55,
-                  height: 55,
-                  decoration: BoxDecoration(
-                    color: category.color.withValues(alpha: .13),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(category.icon, color: category.color),
+            children: [
+              Container(
+                width: 55,
+                height: 55,
+                decoration: BoxDecoration(
+                  color: category.color.withValues(alpha: .13),
+                  shape: BoxShape.circle,
                 ),
-                const SizedBox(height: 22),
-                Text(
-                  expense.merchant.isEmpty ? '名前のない記録' : expense.merchant,
-                  style: const TextStyle(
-                    fontSize: 26,
-                    fontWeight: FontWeight.w800,
-                  ),
+                child: Icon(category.icon, color: category.color),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                expense.merchant.isEmpty ? '名前のない記録' : expense.merchant,
+                style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.w800,
                 ),
-                const SizedBox(height: 5),
-                Text(
-                  _dateFormat.format(expense.date),
-                  style: const TextStyle(color: Color(0xFF6C7578)),
+              ),
+              const SizedBox(height: 5),
+              Text(
+                _dateFormat.format(expense.date),
+                style: const TextStyle(color: Color(0xFF6C7578)),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                _yen.format(expense.amount),
+                style: const TextStyle(
+                  fontSize: 38,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -1,
                 ),
+              ),
+              if (expense.imagePath != null) ...[
                 const SizedBox(height: 18),
-                Text(
-                  _yen.format(expense.amount),
-                  style: const TextStyle(
-                    fontSize: 38,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -1,
-                  ),
+                const Text(
+                  '添付写真',
+                  style: TextStyle(fontWeight: FontWeight.w800),
                 ),
-                if (expense.imagePath != null) ...[
-                  const SizedBox(height: 18),
-                  const Text(
-                    '添付写真',
-                    style: TextStyle(fontWeight: FontWeight.w800),
-                  ),
-                  const SizedBox(height: 8),
-                  ReceiptImageCard(imagePath: expense.imagePath!, height: 118),
-                ],
-                const SizedBox(height: 28),
+                const SizedBox(height: 8),
+                ReceiptImageCard(imagePath: expense.imagePath!, height: 118),
+              ],
+              if (expense.items.isNotEmpty) ...[
+                const SizedBox(height: 22),
+                const Text(
+                  '商品・明細',
+                  style: TextStyle(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 8),
                 Container(
-                  padding: const EdgeInsets.all(18),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 8,
+                  ),
                   decoration: _cardDecoration,
                   child: Column(
-                    children: [
-                      _detailRow('カテゴリ', category.name),
-                      _detailRow('支払い方法', expense.payment),
-                      if (expense.note.isNotEmpty)
-                        _detailRow('メモ', expense.note),
-                      _detailRow(
-                        '記録方法',
-                        expense.source == 'image' ? '画像を添えて記録' : '手動入力',
-                      ),
-                    ],
-                  ),
-                ),
-                const Spacer(),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final confirm = await showDialog<bool>(
-                      context: context,
-                      builder: (_) => AlertDialog(
-                        title: const Text('この記録を削除しますか？'),
-                        content: const Text('削除後は元に戻せません。'),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(context, false),
-                            child: const Text('キャンセル'),
-                          ),
-                          TextButton(
-                            onPressed: () => Navigator.pop(context, true),
-                            style: TextButton.styleFrom(
-                              foregroundColor: _coral,
+                    children: expense.items
+                        .map(
+                          (item) => ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                            leading: Icon(
+                              categoryOf(item.category).icon,
+                              size: 20,
+                              color: categoryOf(item.category).color,
                             ),
-                            child: const Text('削除する'),
+                            title: Text(
+                              item.name,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            subtitle: Text(
+                              '${categoryOf(item.category).name} ・ ${item.quantity}点',
+                            ),
+                            trailing: Text(
+                              _yen.format(item.amount),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
                           ),
-                        ],
-                      ),
-                    );
-                    if (context.mounted && confirm == true) {
-                      Navigator.pop(
-                        context,
-                        const _ExpenseAction(delete: true),
-                      );
-                    }
-                  },
-                  icon: const Icon(Icons.delete_outline_rounded),
-                  label: const Text('この記録を削除'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: _coral,
-                    minimumSize: const Size.fromHeight(50),
-                    side: const BorderSide(color: Color(0xFFDFA89A)),
+                        )
+                        .toList(),
                   ),
                 ),
               ],
-            ),
+              const SizedBox(height: 28),
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: _cardDecoration,
+                child: Column(
+                  children: [
+                    _detailRow('カテゴリ', category.name),
+                    _detailRow('支払い方法', expense.payment),
+                    if (expense.note.isNotEmpty) _detailRow('メモ', expense.note),
+                    _detailRow(
+                      '記録方法',
+                      expense.source == 'image' ? '画像を添えて記録' : '手動入力',
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 26),
+              OutlinedButton.icon(
+                onPressed: () async {
+                  final confirm = await showDialog<bool>(
+                    context: context,
+                    builder: (_) => AlertDialog(
+                      title: const Text('この記録を削除しますか？'),
+                      content: const Text('削除後は元に戻せません。'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('キャンセル'),
+                        ),
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          style: TextButton.styleFrom(foregroundColor: _coral),
+                          child: const Text('削除する'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (context.mounted && confirm == true) {
+                    Navigator.pop(context, const _ExpenseAction(delete: true));
+                  }
+                },
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: const Text('この記録を削除'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: _coral,
+                  minimumSize: const Size.fromHeight(50),
+                  side: const BorderSide(color: Color(0xFFDFA89A)),
+                ),
+              ),
+            ],
           ),
         ),
       ),
