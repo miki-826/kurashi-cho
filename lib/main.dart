@@ -13,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'database.dart';
+import 'gemini_cloud.dart';
 
 const _ink = Color(0xFF23313D);
 const _paper = Color(0xFFFFFBF3);
@@ -33,12 +34,18 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ja_JP');
   final store = await HouseholdStore.open();
-  runApp(KurashiApp(store: store));
+  final cloudSettings = await GeminiCloudSettings.open();
+  runApp(KurashiApp(store: store, cloudSettings: cloudSettings));
 }
 
 class KurashiApp extends StatelessWidget {
-  const KurashiApp({super.key, required this.store});
+  const KurashiApp({
+    super.key,
+    required this.store,
+    required this.cloudSettings,
+  });
   final HouseholdStore store;
+  final GeminiCloudSettings cloudSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -59,7 +66,7 @@ class KurashiApp extends StatelessWidget {
           fontFamily: 'sans-serif',
         ),
       ),
-      home: HomeShell(store: store),
+      home: HomeShell(store: store, cloudSettings: cloudSettings),
     );
   }
 }
@@ -198,6 +205,7 @@ class ReceiptDraft {
     this.confidence,
     this.warnings = const [],
     this.usedAi = false,
+    this.usedCloud = false,
   });
 
   final String imagePath;
@@ -211,6 +219,52 @@ class ReceiptDraft {
   final double? confidence;
   final List<String> warnings;
   final bool usedAi;
+  final bool usedCloud;
+
+  factory ReceiptDraft.fromCloudCandidate({
+    required String imagePath,
+    required String rawText,
+    required CloudExpenseCandidate candidate,
+    required int index,
+  }) {
+    final validCategories = categories.map((category) => category.id).toSet();
+    final category = validCategories.contains(candidate.categoryCode)
+        ? candidate.categoryCode
+        : 'other';
+    final itemCandidates = candidate.items
+        .where((item) => item.amount >= 0)
+        .toList();
+    final itemIdSeed = DateTime.now().microsecondsSinceEpoch;
+    final items = [
+      for (var itemIndex = 0; itemIndex < itemCandidates.length; itemIndex++)
+        ExpenseItem(
+          id: '$itemIdSeed-$index-$itemIndex',
+          name: itemCandidates[itemIndex].name.isEmpty
+              ? '不明な商品'
+              : itemCandidates[itemIndex].name,
+          quantity: max(1, itemCandidates[itemIndex].quantity),
+          amount: itemCandidates[itemIndex].amount,
+          category:
+              validCategories.contains(itemCandidates[itemIndex].categoryCode)
+              ? itemCandidates[itemIndex].categoryCode
+              : 'other',
+        ),
+    ];
+    return ReceiptDraft(
+      imagePath: imagePath,
+      merchant: candidate.merchant,
+      amount: candidate.totalAmount,
+      date: candidate.purchasedAt,
+      category: category,
+      rawText: rawText,
+      payment: candidate.paymentMethod,
+      items: items,
+      confidence: candidate.confidence,
+      warnings: candidate.warnings,
+      usedAi: true,
+      usedCloud: true,
+    );
+  }
 
   ReceiptDraft withNanoResponse(String response) {
     var source = response.trim();
@@ -262,6 +316,7 @@ class ReceiptDraft {
       confidence: confidenceValue?.clamp(0, 1),
       warnings: aiWarnings,
       usedAi: true,
+      usedCloud: false,
     );
   }
 
@@ -506,8 +561,13 @@ class HouseholdStore extends ChangeNotifier {
 }
 
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key, required this.store});
+  const HomeShell({
+    super.key,
+    required this.store,
+    required this.cloudSettings,
+  });
   final HouseholdStore store;
+  final GeminiCloudSettings cloudSettings;
 
   @override
   State<HomeShell> createState() => _HomeShellState();
@@ -564,13 +624,30 @@ class _HomeShellState extends State<HomeShell> {
       maxWidth: 2048,
     );
     if (!mounted || photo == null) return;
-    final draft = await Navigator.of(context).push<ReceiptDraft>(
+    final drafts = await Navigator.of(context).push<List<ReceiptDraft>>(
       MaterialPageRoute(
-        builder: (_) => ReceiptPreviewPage(imagePath: photo.path),
+        builder: (_) => ReceiptPreviewPage(
+          imagePath: photo.path,
+          cloudSettings: widget.cloudSettings,
+        ),
       ),
     );
-    if (!mounted || draft == null) return;
-    await _openAdd(imagePath: draft.imagePath, fromScan: true, draft: draft);
+    if (!mounted || drafts == null || drafts.isEmpty) return;
+    if (drafts.length == 1) {
+      final draft = drafts.single;
+      await _openAdd(imagePath: draft.imagePath, fromScan: true, draft: draft);
+      return;
+    }
+    final expenses = await Navigator.of(context).push<List<Expense>>(
+      MaterialPageRoute(
+        builder: (_) =>
+            MultiExpenseReviewPage(imagePath: photo.path, drafts: drafts),
+      ),
+    );
+    if (!mounted || expenses == null) return;
+    for (final expense in expenses) {
+      await widget.store.upsert(expense);
+    }
   }
 
   void _showAddSheet() {
@@ -601,21 +678,27 @@ class _HomeShellState extends State<HomeShell> {
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 6),
-            const Text(
-              '写真は端末内にだけ保存されます',
-              style: TextStyle(color: Color(0xFF707A7E)),
+            Text(
+              widget.cloudSettings.enabled
+                  ? 'クラウドGemini解析が有効です'
+                  : '写真は端末内にだけ保存されます',
+              style: const TextStyle(color: Color(0xFF707A7E)),
             ),
             const SizedBox(height: 18),
             _AddOption(
               icon: Icons.camera_alt_rounded,
               title: 'カメラで撮る',
-              subtitle: 'レシートを添えて手入力へ',
+              subtitle: widget.cloudSettings.enabled
+                  ? '複数のレシート・費用もまとめて解析'
+                  : 'レシートを添えて手入力へ',
               onTap: () => _pickPhoto(ImageSource.camera),
             ),
             _AddOption(
               icon: Icons.photo_library_rounded,
               title: '写真を選ぶ',
-              subtitle: '購入画面・請求画面にも対応',
+              subtitle: widget.cloudSettings.enabled
+                  ? '明細一覧・複数取引の画像にも対応'
+                  : '購入画面・請求画面にも対応',
               onTap: () => _pickPhoto(ImageSource.gallery),
             ),
             _AddOption(
@@ -651,6 +734,7 @@ class _HomeShellState extends State<HomeShell> {
             builder: (_) => BudgetSettingsPage(
               budget: widget.store.budgetFor(_month),
               onSave: (value) => widget.store.setBudget(_month, value),
+              cloudSettings: widget.cloudSettings,
             ),
           ),
         ),
@@ -1316,10 +1400,12 @@ class BudgetSettingsPage extends StatefulWidget {
     super.key,
     required this.budget,
     required this.onSave,
+    required this.cloudSettings,
   });
 
   final int budget;
   final Future<void> Function(int) onSave;
+  final GeminiCloudSettings cloudSettings;
 
   @override
   State<BudgetSettingsPage> createState() => _BudgetSettingsPageState();
@@ -1327,19 +1413,24 @@ class BudgetSettingsPage extends StatefulWidget {
 
 class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
   late final TextEditingController _budget;
+  late final TextEditingController _apiKey;
   String _aiStatus = 'CHECKING';
   bool _checkingAi = false;
+  bool _testingCloud = false;
+  String? _cloudMessage;
 
   @override
   void initState() {
     super.initState();
     _budget = TextEditingController(text: widget.budget.toString());
+    _apiKey = TextEditingController();
     _refreshAiStatus();
   }
 
   @override
   void dispose() {
     _budget.dispose();
+    _apiKey.dispose();
     super.dispose();
   }
 
@@ -1351,8 +1442,66 @@ class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
       ).showSnackBar(const SnackBar(content: Text('予算を0円以上で入力してください')));
       return;
     }
+    if (_apiKey.text.trim().isNotEmpty) {
+      await widget.cloudSettings.saveApiKey(_apiKey.text);
+      _apiKey.clear();
+    }
     await widget.onSave(value);
     if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _toggleCloud(bool value) async {
+    if (value &&
+        !widget.cloudSettings.hasApiKey &&
+        _apiKey.text.trim().isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('先にGemini APIキーを入力してください。')));
+      return;
+    }
+    if (_apiKey.text.trim().isNotEmpty) {
+      await widget.cloudSettings.saveApiKey(_apiKey.text);
+      _apiKey.clear();
+    }
+    await widget.cloudSettings.setEnabled(value);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _testCloud() async {
+    setState(() {
+      _testingCloud = true;
+      _cloudMessage = null;
+    });
+    try {
+      if (_apiKey.text.trim().isNotEmpty) {
+        await widget.cloudSettings.saveApiKey(_apiKey.text);
+        _apiKey.clear();
+      }
+      final client = GeminiCloudClient(widget.cloudSettings);
+      try {
+        await client.testConnection();
+      } finally {
+        client.close();
+      }
+      if (!mounted) return;
+      setState(() => _cloudMessage = '接続できました。画像解析を利用できます。');
+    } on GeminiCloudException catch (error) {
+      if (!mounted) return;
+      setState(() => _cloudMessage = '接続できません：${error.message}');
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _cloudMessage = '接続を確認できませんでした。');
+    } finally {
+      if (mounted) setState(() => _testingCloud = false);
+    }
+  }
+
+  Future<void> _clearCloudKey() async {
+    await widget.cloudSettings.clearApiKey();
+    _apiKey.clear();
+    if (mounted) {
+      setState(() => _cloudMessage = 'APIキーを端末から削除しました。');
+    }
   }
 
   Future<void> _refreshAiStatus() async {
@@ -1422,11 +1571,136 @@ class _BudgetSettingsPageState extends State<BudgetSettingsPage> {
             Container(
               padding: const EdgeInsets.all(17),
               decoration: _cardDecoration,
-              child: const Column(
+              child: Column(
                 children: [
-                  _InfoLine(Icons.lock_outline_rounded, '記録はこの端末に保存'),
-                  _InfoLine(Icons.image_outlined, '添付画像は外部へ送信しない'),
-                  _InfoLine(Icons.auto_awesome_outlined, 'レシート文字は端末内で読み取り'),
+                  const _InfoLine(Icons.lock_outline_rounded, '記録はこの端末に保存'),
+                  _InfoLine(
+                    Icons.image_outlined,
+                    widget.cloudSettings.enabled
+                        ? 'クラウド解析時だけ画像をGoogle Gemini APIへ送信'
+                        : '添付画像は外部へ送信しない',
+                  ),
+                  const _InfoLine(
+                    Icons.auto_awesome_outlined,
+                    'レシート文字は最初に端末内で読み取り',
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 28),
+            const Text(
+              'クラウドGemini API',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(17),
+              decoration: _cardDecoration,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text(
+                      'クラウド解析を使う',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    subtitle: const Text('1枚の画像から複数の費用を抽出できます'),
+                    value: widget.cloudSettings.enabled,
+                    onChanged: _toggleCloud,
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: _apiKey,
+                    obscureText: true,
+                    enableSuggestions: false,
+                    autocorrect: false,
+                    decoration:
+                        _inputDecoration(
+                          hint: widget.cloudSettings.hasApiKey
+                              ? 'APIキー設定済み（変更時のみ入力）'
+                              : 'Google AI StudioのAPIキー',
+                        ).copyWith(
+                          prefixIcon: const Icon(Icons.key_rounded),
+                          suffixIcon: widget.cloudSettings.hasApiKey
+                              ? const Icon(Icons.check_circle, color: _sage)
+                              : null,
+                        ),
+                  ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: widget.cloudSettings.model,
+                    decoration: _inputDecoration(),
+                    items: geminiCloudModels.entries
+                        .map(
+                          (entry) => DropdownMenuItem(
+                            value: entry.key,
+                            child: Text(
+                              entry.value,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (value) async {
+                      if (value == null) return;
+                      await widget.cloudSettings.setModel(value);
+                      if (mounted) setState(() {});
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF2E8),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: const Text(
+                      'クラウド解析を有効にすると、選んだ画像とOCR文字列がGoogleへ送信され、利用量に応じて料金が発生する場合があります。キーはOSの暗号化ストレージへ保存しますが、モバイル端末内のキーを完全に秘匿することはできません。個人用の制限付きキーを使用してください。',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        height: 1.45,
+                        color: Color(0xFF795548),
+                      ),
+                    ),
+                  ),
+                  if (_cloudMessage != null) ...[
+                    const SizedBox(height: 10),
+                    Text(
+                      _cloudMessage!,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _cloudMessage!.startsWith('接続できました')
+                            ? _sage
+                            : _coral,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      FilledButton.tonalIcon(
+                        onPressed: _testingCloud ? null : _testCloud,
+                        icon: _testingCloud
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.wifi_tethering_rounded),
+                        label: const Text('接続テスト'),
+                      ),
+                      const Spacer(),
+                      if (widget.cloudSettings.hasApiKey)
+                        TextButton(
+                          onPressed: _testingCloud ? null : _clearCloudKey,
+                          style: TextButton.styleFrom(foregroundColor: _coral),
+                          child: const Text('キーを削除'),
+                        ),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -1637,8 +1911,13 @@ class _AddOption extends StatelessWidget {
 }
 
 class ReceiptPreviewPage extends StatefulWidget {
-  const ReceiptPreviewPage({super.key, required this.imagePath});
+  const ReceiptPreviewPage({
+    super.key,
+    required this.imagePath,
+    required this.cloudSettings,
+  });
   final String imagePath;
+  final GeminiCloudSettings cloudSettings;
 
   @override
   State<ReceiptPreviewPage> createState() => _ReceiptPreviewPageState();
@@ -1646,9 +1925,12 @@ class ReceiptPreviewPage extends StatefulWidget {
 
 class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
   var _isReading = false;
-  ReceiptDraft? _draft;
+  List<ReceiptDraft> _drafts = [];
   String? _error;
   String _nanoStatus = 'CHECKING';
+  String _cloudStatus = 'IDLE';
+
+  ReceiptDraft? get _draft => _drafts.firstOrNull;
 
   @override
   void initState() {
@@ -1661,37 +1943,91 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
     setState(() {
       _isReading = true;
       _error = null;
+      _drafts = [];
+      _nanoStatus = 'CHECKING';
+      _cloudStatus = 'IDLE';
     });
-    TextRecognizer? recognizer;
     try {
-      recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
-      final result = await recognizer
-          .processImage(InputImage.fromFilePath(widget.imagePath))
-          .timeout(const Duration(seconds: 15));
+      var ocrText = '';
+      var ocrDraft = ReceiptDraft(imagePath: widget.imagePath);
+      TextRecognizer? recognizer;
+      try {
+        recognizer = TextRecognizer(script: TextRecognitionScript.japanese);
+        final result = await recognizer
+            .processImage(InputImage.fromFilePath(widget.imagePath))
+            .timeout(const Duration(seconds: 15));
+        ocrText = result.text;
+        ocrDraft = ReceiptDraft.fromRecognizedText(widget.imagePath, ocrText);
+      } catch (_) {
+        _error = widget.cloudSettings.enabled
+            ? '端末内で文字を読み取れませんでした。画像全体をクラウドGeminiで解析します。'
+            : '文字を読み取れませんでした。写真は添えたまま手入力で続けられます。';
+      } finally {
+        await recognizer?.close();
+      }
       if (!mounted) return;
-      final ocrDraft = ReceiptDraft.fromRecognizedText(
-        widget.imagePath,
-        result.text,
-      );
       setState(() {
-        _draft = ocrDraft;
-        if (result.text.trim().isEmpty) {
+        _drafts = [ocrDraft];
+        if (ocrText.trim().isEmpty && _error == null) {
           _error = '文字を検出できませんでした。明るい場所で、文字が正面に写るよう撮影してください。';
         }
       });
+      if (widget.cloudSettings.enabled && widget.cloudSettings.hasApiKey) {
+        setState(() => _cloudStatus = 'ANALYZING');
+        final client = GeminiCloudClient(widget.cloudSettings);
+        try {
+          final candidates = await client.analyzeImage(
+            imagePath: widget.imagePath,
+            ocrText: ocrText,
+            categories: {
+              for (final category in categories) category.id: category.name,
+            },
+          );
+          if (!mounted) return;
+          setState(() {
+            _drafts = [
+              for (var index = 0; index < candidates.length; index++)
+                ReceiptDraft.fromCloudCandidate(
+                  imagePath: widget.imagePath,
+                  rawText: ocrText,
+                  candidate: candidates[index],
+                  index: index,
+                ),
+            ];
+            _error = null;
+            _cloudStatus = 'SUCCESS';
+            _nanoStatus = 'SKIPPED';
+          });
+          return;
+        } on GeminiCloudException catch (error) {
+          if (!mounted) return;
+          setState(() {
+            _cloudStatus = 'ERROR';
+            _error = 'クラウドGemini：${error.message} 端末内解析へ切り替えます。';
+          });
+        } catch (_) {
+          if (!mounted) return;
+          setState(() {
+            _cloudStatus = 'ERROR';
+            _error = 'クラウドGeminiへ接続できませんでした。端末内解析へ切り替えます。';
+          });
+        } finally {
+          client.close();
+        }
+      }
       final status = await NanoGateway.checkStatus();
       if (!mounted) return;
       setState(() => _nanoStatus = status);
-      if (status == 'AVAILABLE' && result.text.trim().isNotEmpty) {
+      if (status == 'AVAILABLE' && ocrText.trim().isNotEmpty) {
         setState(() => _nanoStatus = 'ANALYZING');
         try {
           final response = await NanoGateway.analyze(
             imagePath: widget.imagePath,
-            ocrText: result.text,
+            ocrText: ocrText,
           );
           if (!mounted) return;
           setState(() {
-            _draft = ocrDraft.withNanoResponse(response);
+            _drafts = [ocrDraft.withNanoResponse(response)];
             _nanoStatus = 'AVAILABLE';
           });
         } catch (_) {
@@ -1707,7 +2043,6 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
         setState(() => _error = '文字を読み取れませんでした。写真は添えたまま手入力で続けられます。');
       }
     } finally {
-      await recognizer?.close();
       if (mounted) setState(() => _isReading = false);
     }
   }
@@ -1732,7 +2067,15 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
     'DOWNLOADING' => '端末内AIをダウンロードしています…',
     'UNAVAILABLE' => 'この端末ではOCR候補と手入力を利用します',
     'ERROR' => '端末内AIは利用できません。OCR候補は使用できます',
+    'SKIPPED' => 'クラウドGeminiの解析結果を使用しています',
     _ => '端末内AIの状態を確認しています…',
+  };
+
+  String get _cloudMessage => switch (_cloudStatus) {
+    'ANALYZING' => '画像をクラウドGeminiへ送信して複数の費用を解析しています…',
+    'SUCCESS' => '${_drafts.length}件の費用候補をクラウドGeminiで検出しました',
+    'ERROR' => 'クラウド解析に失敗したため端末内解析へ切り替えました',
+    _ => 'クラウドGemini解析が有効です',
   };
 
   @override
@@ -1783,9 +2126,14 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 5),
-                const Text(
-                  '端末内で文字を読み取っています。内容は保存前に必ず確認・修正できます。',
-                  style: TextStyle(color: Color(0xFF6D777B), height: 1.45),
+                Text(
+                  widget.cloudSettings.enabled
+                      ? '端末内OCRのあと、画像をGoogle Gemini APIへ送信します。内容は保存前に必ず確認・修正できます。'
+                      : '端末内で文字を読み取っています。内容は保存前に必ず確認・修正できます。',
+                  style: const TextStyle(
+                    color: Color(0xFF6D777B),
+                    height: 1.45,
+                  ),
                 ),
                 if (_isReading) ...[
                   const SizedBox(height: 14),
@@ -1806,14 +2154,63 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                           ),
                         ),
                         SizedBox(width: 10),
-                        Text('レシートの文字を読み取っています…'),
+                        Expanded(child: Text('画像から費用を読み取っています…')),
                       ],
                     ),
                   ),
                 ],
-                if (_draft != null) ...[
+                if (_drafts.isNotEmpty) ...[
                   const SizedBox(height: 14),
-                  _OcrCandidateCard(draft: _draft!),
+                  if (_drafts.length > 1)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        '${_drafts.length}件の費用を検出しました',
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ..._drafts.indexed.map(
+                    (entry) => Padding(
+                      padding: const EdgeInsets.only(bottom: 9),
+                      child: _OcrCandidateCard(
+                        draft: entry.$2,
+                        index: _drafts.length > 1 ? entry.$1 + 1 : null,
+                        showRawText: entry.$1 == 0,
+                      ),
+                    ),
+                  ),
+                ],
+                if (widget.cloudSettings.enabled) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 13,
+                      vertical: 11,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE7EDF4),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.cloud_outlined,
+                          size: 19,
+                          color: Color(0xFF5A7892),
+                        ),
+                        const SizedBox(width: 9),
+                        Expanded(
+                          child: Text(
+                            _cloudMessage,
+                            style: const TextStyle(fontSize: 12.5),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ],
                 const SizedBox(height: 10),
                 Container(
@@ -1880,10 +2277,18 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
                 OutlinedButton.icon(
                   onPressed: () => Navigator.pop(
                     context,
-                    _draft ?? ReceiptDraft(imagePath: widget.imagePath),
+                    _drafts.isEmpty
+                        ? [ReceiptDraft(imagePath: widget.imagePath)]
+                        : _drafts,
                   ),
                   icon: const Icon(Icons.edit_note_rounded),
-                  label: Text(_draft == null ? '写真を添えて手入力へ' : '候補を確認・修正する'),
+                  label: Text(
+                    _drafts.isEmpty
+                        ? '写真を添えて手入力へ'
+                        : _drafts.length > 1
+                        ? '${_drafts.length}件の費用を確認する'
+                        : '候補を確認・修正する',
+                  ),
                   style: OutlinedButton.styleFrom(
                     minimumSize: const Size.fromHeight(50),
                   ),
@@ -1898,8 +2303,14 @@ class _ReceiptPreviewPageState extends State<ReceiptPreviewPage> {
 }
 
 class _OcrCandidateCard extends StatelessWidget {
-  const _OcrCandidateCard({required this.draft});
+  const _OcrCandidateCard({
+    required this.draft,
+    this.index,
+    this.showRawText = true,
+  });
   final ReceiptDraft draft;
+  final int? index;
+  final bool showRawText;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -1911,11 +2322,22 @@ class _OcrCandidateCard extends StatelessWidget {
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Row(
+        Row(
           children: [
-            Icon(Icons.auto_awesome_rounded, size: 17, color: _sage),
-            SizedBox(width: 7),
-            Text('読み取り候補', style: TextStyle(fontWeight: FontWeight.w800)),
+            Icon(
+              draft.usedCloud
+                  ? Icons.cloud_done_outlined
+                  : Icons.auto_awesome_rounded,
+              size: 17,
+              color: _sage,
+            ),
+            const SizedBox(width: 7),
+            Text(
+              index == null
+                  ? '読み取り候補'
+                  : '費用 $index・${draft.usedCloud ? 'クラウド解析' : '読み取り候補'}',
+              style: const TextStyle(fontWeight: FontWeight.w800),
+            ),
           ],
         ),
         const SizedBox(height: 8),
@@ -1939,32 +2361,34 @@ class _OcrCandidateCard extends StatelessWidget {
               style: const TextStyle(fontSize: 12, color: _coral),
             ),
           ),
-        const SizedBox(height: 10),
-        const Text(
-          '読み取った文字',
-          style: TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w800,
-            color: Color(0xFF5E6A61),
+        if (showRawText) ...[
+          const SizedBox(height: 10),
+          const Text(
+            '読み取った文字',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              color: Color(0xFF5E6A61),
+            ),
           ),
-        ),
-        const SizedBox(height: 4),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(9),
-          decoration: BoxDecoration(
-            color: const Color(0x88FFFFFF),
-            borderRadius: BorderRadius.circular(10),
+          const SizedBox(height: 4),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(9),
+            decoration: BoxDecoration(
+              color: const Color(0x88FFFFFF),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Text(
+              draft.rawText.trim().isEmpty
+                  ? '文字を検出できませんでした。写真を添えたまま手入力できます。'
+                  : draft.rawText.trim(),
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 12, height: 1.35),
+            ),
           ),
-          child: Text(
-            draft.rawText.trim().isEmpty
-                ? '文字を検出できませんでした。写真を添えたまま手入力できます。'
-                : draft.rawText.trim(),
-            maxLines: 5,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12, height: 1.35),
-          ),
-        ),
+        ],
       ],
     ),
   );
@@ -2259,6 +2683,263 @@ class ExportPage extends StatelessWidget {
   }
 }
 
+class MultiExpenseReviewPage extends StatefulWidget {
+  const MultiExpenseReviewPage({
+    super.key,
+    required this.imagePath,
+    required this.drafts,
+  });
+
+  final String imagePath;
+  final List<ReceiptDraft> drafts;
+
+  @override
+  State<MultiExpenseReviewPage> createState() => _MultiExpenseReviewPageState();
+}
+
+class _MultiExpenseReviewPageState extends State<MultiExpenseReviewPage> {
+  late List<ReceiptDraft> _drafts;
+  late List<Expense?> _expenses;
+
+  @override
+  void initState() {
+    super.initState();
+    _drafts = [...widget.drafts];
+    _expenses = [
+      for (var index = 0; index < _drafts.length; index++)
+        _expenseFromDraft(_drafts[index], index),
+    ];
+  }
+
+  Expense? _expenseFromDraft(ReceiptDraft draft, int index) {
+    final amount = draft.amount;
+    final date = draft.date;
+    if (amount == null || amount <= 0 || date == null) return null;
+    final id = '${DateTime.now().microsecondsSinceEpoch}-$index';
+    final items = draft.items.isEmpty
+        ? [
+            ExpenseItem(
+              id: '$id-item-0',
+              name: draft.merchant?.isNotEmpty == true ? draft.merchant! : '支出',
+              quantity: 1,
+              amount: amount,
+              category: draft.category,
+            ),
+          ]
+        : draft.items;
+    return Expense(
+      id: id,
+      merchant: draft.merchant ?? '',
+      amount: amount,
+      date: date,
+      category: draft.category,
+      note: '',
+      payment: draft.payment?.isNotEmpty == true ? draft.payment! : '現金',
+      source: draft.usedCloud ? 'cloud_gemini' : 'image',
+      imagePath: widget.imagePath,
+      items: items,
+    );
+  }
+
+  Future<void> _edit(int index) async {
+    final existing = _expenses[index];
+    final edited = await Navigator.of(context).push<Expense>(
+      MaterialPageRoute(
+        builder: (_) => ExpenseEditor(
+          initial: existing,
+          imagePath: widget.imagePath,
+          fromScan: true,
+          draft: existing == null ? _drafts[index] : null,
+        ),
+      ),
+    );
+    if (!mounted || edited == null) return;
+    setState(() => _expenses[index] = edited);
+  }
+
+  void _remove(int index) {
+    setState(() {
+      _drafts.removeAt(index);
+      _expenses.removeAt(index);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ready =
+        _expenses.isNotEmpty && _expenses.every((value) => value != null);
+    return Scaffold(
+      backgroundColor: _paper,
+      appBar: AppBar(
+        backgroundColor: _paper,
+        title: const Text(
+          '複数の費用を確認',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 680),
+            child: Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+                  child: Container(
+                    padding: const EdgeInsets.all(15),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE7EDF4),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(
+                          Icons.fact_check_outlined,
+                          color: Color(0xFF5A7892),
+                        ),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            '同じ画像から検出した費用です。不要な候補は削除し、内容を確認してからまとめて保存してください。',
+                            style: TextStyle(fontSize: 12.5, height: 1.4),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 16),
+                    itemCount: _drafts.length,
+                    itemBuilder: (_, index) {
+                      final draft = _drafts[index];
+                      final expense = _expenses[index];
+                      final category = categoryOf(
+                        expense?.category ?? draft.category,
+                      );
+                      return Card(
+                        elevation: 0,
+                        color: const Color(0xFFFFFDF8),
+                        margin: const EdgeInsets.only(bottom: 10),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          side: BorderSide(
+                            color: expense == null
+                                ? const Color(0xFFE0A493)
+                                : const Color(0xFFE9E4D9),
+                          ),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(15),
+                          child: Column(
+                            children: [
+                              Row(
+                                children: [
+                                  CircleAvatar(
+                                    backgroundColor: category.color.withValues(
+                                      alpha: .13,
+                                    ),
+                                    foregroundColor: category.color,
+                                    child: Icon(category.icon, size: 19),
+                                  ),
+                                  const SizedBox(width: 11),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          expense?.merchant.isNotEmpty == true
+                                              ? expense!.merchant
+                                              : draft.merchant ?? '名前のない費用',
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                        ),
+                                        Text(
+                                          expense == null
+                                              ? '日付または金額を確認してください'
+                                              : '${_dateFormat.format(expense.date)} ・ ${expense.items.length}明細',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: expense == null
+                                                ? _coral
+                                                : const Color(0xFF6D777B),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Text(
+                                    expense != null
+                                        ? _yen.format(expense.amount)
+                                        : draft.amount == null
+                                        ? '未検出'
+                                        : _yen.format(draft.amount),
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Row(
+                                children: [
+                                  TextButton.icon(
+                                    onPressed: () => _edit(index),
+                                    icon: const Icon(Icons.edit_outlined),
+                                    label: Text(
+                                      expense == null ? '入力する' : '確認・編集',
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  IconButton(
+                                    onPressed: () => _remove(index),
+                                    tooltip: '候補を削除',
+                                    icon: const Icon(
+                                      Icons.delete_outline_rounded,
+                                      color: _coral,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+                  child: FilledButton.icon(
+                    onPressed: ready
+                        ? () => Navigator.pop(
+                            context,
+                            _expenses.whereType<Expense>().toList(),
+                          )
+                        : null,
+                    icon: const Icon(Icons.save_outlined),
+                    label: Text(
+                      ready ? '${_expenses.length}件をまとめて保存' : '未確認の費用を入力してください',
+                    ),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _ink,
+                      foregroundColor: _paper,
+                      minimumSize: const Size.fromHeight(54),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ExpenseEditor extends StatefulWidget {
   const ExpenseEditor({
     super.key,
@@ -2356,7 +3037,13 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
         category: _category,
         note: _note.text.trim(),
         payment: _payment,
-        source: widget.fromScan ? 'image' : 'manual',
+        source:
+            widget.initial?.source ??
+            (widget.draft?.usedCloud == true
+                ? 'cloud_gemini'
+                : widget.fromScan
+                ? 'image'
+                : 'manual'),
         imagePath: widget.imagePath ?? widget.initial?.imagePath,
         items: items,
       ),
@@ -2435,14 +3122,17 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
                       color: const Color(0xFFE9EFE3),
                       borderRadius: BorderRadius.circular(16),
                     ),
-                    child: const Row(
+                    child: Row(
                       children: [
-                        Icon(Icons.privacy_tip_outlined, color: _sage),
-                        SizedBox(width: 10),
+                        const Icon(Icons.privacy_tip_outlined, color: _sage),
+                        const SizedBox(width: 10),
                         Expanded(
                           child: Text(
-                            '画像を添えました。内容を確認してから保存してください。画像は外部送信しません。',
-                            style: TextStyle(fontSize: 13, height: 1.4),
+                            widget.draft?.usedCloud == true ||
+                                    widget.initial?.source == 'cloud_gemini'
+                                ? '画像をクラウドGeminiで解析しました。内容を確認してから保存してください。'
+                                : '画像を添えました。内容を確認してから保存してください。画像は外部送信しません。',
+                            style: const TextStyle(fontSize: 13, height: 1.4),
                           ),
                         ),
                       ],

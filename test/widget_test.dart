@@ -1,7 +1,10 @@
+import 'dart:convert';
+
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:household_ai/database.dart';
+import 'package:household_ai/gemini_cloud.dart';
 import 'package:household_ai/main.dart';
 import 'package:intl/date_symbol_data_local.dart';
 
@@ -69,6 +72,101 @@ void main() {
 
     expect(expense.amountForCategory('food'), 1000);
     expect(expense.amountForCategory('daily'), 500);
+  });
+
+  test('Gemini response parses multiple expenses and line items', () {
+    final response = jsonEncode({
+      'candidates': [
+        {
+          'content': {
+            'parts': [
+              {
+                'text': jsonEncode({
+                  'purchases': [
+                    {
+                      'merchant': 'スーパー',
+                      'purchasedAt': '2026-07-30T10:20:00+09:00',
+                      'totalAmount': 1280,
+                      'paymentMethod': '現金',
+                      'categoryCode': 'food',
+                      'items': [
+                        {
+                          'name': '野菜',
+                          'quantity': 2,
+                          'amount': 680,
+                          'categoryCode': 'food',
+                        },
+                        {
+                          'name': '洗剤',
+                          'quantity': 1,
+                          'amount': 600,
+                          'categoryCode': 'daily',
+                        },
+                      ],
+                      'confidence': 0.94,
+                      'warnings': <String>[],
+                    },
+                    {
+                      'merchant': '駐車場',
+                      'purchasedAt': '2026-07-30T11:00:00+09:00',
+                      'totalAmount': 500,
+                      'paymentMethod': null,
+                      'categoryCode': 'transport',
+                      'items': <Object>[],
+                      'confidence': 0.81,
+                      'warnings': ['支払い方法を確認してください'],
+                    },
+                  ],
+                }),
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    final expenses = GeminiCloudClient.parseGeminiExpenseResponse(response);
+    expect(expenses, hasLength(2));
+    expect(expenses.first.totalAmount, 1280);
+    expect(expenses.first.items, hasLength(2));
+    expect(expenses.last.merchant, '駐車場');
+    expect(expenses.last.warnings, hasLength(1));
+  });
+
+  test('cloud candidates become independently editable receipt drafts', () {
+    const candidate = CloudExpenseCandidate(
+      merchant: 'まとめ買い',
+      purchasedAt: null,
+      totalAmount: 900,
+      paymentMethod: '現金',
+      categoryCode: 'food',
+      items: [
+        CloudExpenseItemCandidate(
+          name: '同じ商品',
+          quantity: 1,
+          amount: 400,
+          categoryCode: 'food',
+        ),
+        CloudExpenseItemCandidate(
+          name: '同じ商品',
+          quantity: 1,
+          amount: 500,
+          categoryCode: 'food',
+        ),
+      ],
+      confidence: 0.9,
+      warnings: [],
+    );
+
+    final draft = ReceiptDraft.fromCloudCandidate(
+      imagePath: '/tmp/multiple.jpg',
+      rawText: '',
+      candidate: candidate,
+      index: 1,
+    );
+    expect(draft.usedCloud, isTrue);
+    expect(draft.items, hasLength(2));
+    expect(draft.items.map((item) => item.id).toSet(), hasLength(2));
   });
 
   test('purchase and items are saved and deleted in one database', () async {
