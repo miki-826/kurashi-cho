@@ -1,10 +1,12 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _ink = Color(0xFF23313D);
@@ -158,7 +160,8 @@ class HouseholdStore extends ChangeNotifier {
   }
 
   Future<void> upsert(Expense value) async {
-    expenses = [...expenses.where((expense) => expense.id != value.id), value]
+    final saved = await _copyImageToAppStorage(value);
+    expenses = [...expenses.where((expense) => expense.id != saved.id), saved]
       ..sort((a, b) => b.date.compareTo(a.date));
     await _persist();
     notifyListeners();
@@ -180,6 +183,38 @@ class HouseholdStore extends ChangeNotifier {
     'expenses_v1',
     jsonEncode(expenses.map((expense) => expense.toJson()).toList()),
   );
+
+  Future<Expense> _copyImageToAppStorage(Expense value) async {
+    final sourcePath = value.imagePath;
+    if (sourcePath == null || sourcePath.isEmpty) return value;
+    final source = File(sourcePath);
+    if (!await source.exists()) return value;
+    final documents = await getApplicationDocumentsDirectory();
+    final receiptDirectory = Directory(
+      '${documents.path}${Platform.pathSeparator}receipts',
+    );
+    if (source.path.startsWith(receiptDirectory.path)) return value;
+    await receiptDirectory.create(recursive: true);
+    final match = RegExp(
+      r'\.(jpe?g|png|webp)$',
+      caseSensitive: false,
+    ).firstMatch(source.path);
+    final extension = match?.group(0) ?? '.jpg';
+    final copied = await source.copy(
+      '${receiptDirectory.path}${Platform.pathSeparator}${value.id}$extension',
+    );
+    return Expense(
+      id: value.id,
+      merchant: value.merchant,
+      amount: value.amount,
+      date: value.date,
+      category: value.category,
+      note: value.note,
+      payment: value.payment,
+      source: value.source,
+      imagePath: copied.path,
+    );
+  }
 }
 
 class HomeShell extends StatefulWidget {
@@ -233,7 +268,13 @@ class _HomeShellState extends State<HomeShell> {
       maxWidth: 2048,
     );
     if (!mounted || photo == null) return;
-    await _openAdd(imagePath: photo.path, fromScan: true);
+    final approvedPath = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => ReceiptPreviewPage(imagePath: photo.path),
+      ),
+    );
+    if (!mounted || approvedPath == null) return;
+    await _openAdd(imagePath: approvedPath, fromScan: true);
   }
 
   void _showAddSheet() {
@@ -1124,6 +1165,82 @@ class _AddOption extends StatelessWidget {
   );
 }
 
+class ReceiptPreviewPage extends StatelessWidget {
+  const ReceiptPreviewPage({super.key, required this.imagePath});
+  final String imagePath;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: _paper,
+    appBar: AppBar(
+      backgroundColor: _paper,
+      title: const Text('写真を確認', style: TextStyle(fontWeight: FontWeight.w800)),
+    ),
+    body: SafeArea(
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 680),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(24),
+                    child: ColoredBox(
+                      color: const Color(0xFFF0EEE7),
+                      child: Image.file(
+                        File(imagePath),
+                        fit: BoxFit.contain,
+                        errorBuilder: (_, _, _) => const Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.broken_image_outlined,
+                                size: 42,
+                                color: _sage,
+                              ),
+                              SizedBox(height: 10),
+                              Text('写真を表示できませんでした'),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Text(
+                  'この写真を添えて記録します',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 5),
+                const Text(
+                  '保存するまで端末内の一時データです。内容はあとから手入力で確認・修正できます。',
+                  style: TextStyle(color: Color(0xFF6D777B), height: 1.45),
+                ),
+                const SizedBox(height: 18),
+                FilledButton.icon(
+                  onPressed: () => Navigator.pop(context, imagePath),
+                  icon: const Icon(Icons.arrow_forward_rounded),
+                  label: const Text('この写真で入力を続ける'),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _ink,
+                    foregroundColor: _paper,
+                    minimumSize: const Size.fromHeight(54),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 class HistoryPage extends StatefulWidget {
   const HistoryPage({
     super.key,
@@ -1423,6 +1540,7 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
 
   @override
   Widget build(BuildContext context) {
+    final imagePath = widget.imagePath ?? widget.initial?.imagePath;
     return Scaffold(
       appBar: AppBar(
         backgroundColor: _paper,
@@ -1447,6 +1565,15 @@ class _ExpenseEditorState extends State<ExpenseEditor> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(20, 8, 20, 32),
               children: [
+                if (imagePath != null) ...[
+                  const Text(
+                    '添付した写真',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 8),
+                  ReceiptImageCard(imagePath: imagePath),
+                  const SizedBox(height: 18),
+                ],
                 if (widget.fromScan)
                   Container(
                     margin: const EdgeInsets.only(bottom: 18),
@@ -1612,6 +1739,42 @@ InputDecoration _inputDecoration({String? hint, String? prefix}) =>
       ),
     );
 
+class ReceiptImageCard extends StatelessWidget {
+  const ReceiptImageCard({
+    super.key,
+    required this.imagePath,
+    this.height = 190,
+  });
+  final String imagePath;
+  final double height;
+
+  @override
+  Widget build(BuildContext context) => ClipRRect(
+    borderRadius: BorderRadius.circular(18),
+    child: SizedBox(
+      height: height,
+      width: double.infinity,
+      child: ColoredBox(
+        color: const Color(0xFFF0EEE7),
+        child: Image.file(
+          File(imagePath),
+          fit: BoxFit.cover,
+          errorBuilder: (_, _, _) => const Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.broken_image_outlined, color: _sage),
+                SizedBox(height: 6),
+                Text('写真を表示できませんでした'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 class _ExpenseAction {
   const _ExpenseAction({this.expense, this.delete = false});
   final Expense? expense;
@@ -1686,6 +1849,15 @@ class ExpenseDetail extends StatelessWidget {
                     letterSpacing: -1,
                   ),
                 ),
+                if (expense.imagePath != null) ...[
+                  const SizedBox(height: 18),
+                  const Text(
+                    '添付写真',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 8),
+                  ReceiptImageCard(imagePath: expense.imagePath!, height: 118),
+                ],
                 const SizedBox(height: 28),
                 Container(
                   padding: const EdgeInsets.all(18),
