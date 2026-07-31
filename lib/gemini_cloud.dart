@@ -214,29 +214,14 @@ class GeminiCloudClient {
         .post(
           uri,
           headers: {'Content-Type': 'application/json', 'x-goog-api-key': key},
-          body: jsonEncode({
-            'contents': [
-              {
-                'parts': [
-                  {'text': _prompt(ocrText, categories)},
-                  {
-                    'inline_data': {
-                      'mime_type': mimeType,
-                      'data': base64Encode(bytes),
-                    },
-                  },
-                ],
-              },
-            ],
-            'generationConfig': {
-              'responseFormat': {
-                'text': {
-                  'mimeType': 'application/json',
-                  'schema': _responseSchema(categories.keys.toList()),
-                },
-              },
-            },
-          }),
+          body: jsonEncode(
+            createGenerateContentRequest(
+              imageBase64: base64Encode(bytes),
+              imageMimeType: mimeType,
+              ocrText: ocrText,
+              categories: categories,
+            ),
+          ),
         )
         .timeout(const Duration(seconds: 120));
     if (response.statusCode != 200) {
@@ -244,6 +229,32 @@ class GeminiCloudClient {
     }
     return parseGeminiExpenseResponse(response.body);
   }
+
+  @visibleForTesting
+  static Map<String, dynamic> createGenerateContentRequest({
+    required String imageBase64,
+    required String imageMimeType,
+    required String ocrText,
+    required Map<String, String> categories,
+  }) => {
+    'contents': [
+      {
+        'parts': [
+          {'text': _prompt(ocrText, categories)},
+          {
+            'inlineData': {'mimeType': imageMimeType, 'data': imageBase64},
+          },
+        ],
+      },
+    ],
+    // generateContent's broadly supported structured-output fields are used
+    // instead of responseFormat. The latter expects an enum on some v1beta
+    // serving paths and rejects the literal "application/json".
+    'generationConfig': {
+      'responseMimeType': 'application/json',
+      'responseSchema': _responseSchema(categories.keys.toList()),
+    },
+  };
 
   static List<CloudExpenseCandidate> parseGeminiExpenseResponse(
     String responseBody,
@@ -304,7 +315,7 @@ class GeminiCloudClient {
     return 'image/jpeg';
   }
 
-  String _prompt(String ocrText, Map<String, String> categories) =>
+  static String _prompt(String ocrText, Map<String, String> categories) =>
       '''
 あなたは日本の家計簿アプリの購入画像解析エンジンです。
 画像内にある実際に支払った費用を抽出してください。
@@ -326,44 +337,41 @@ ${categories.entries.map((entry) => '${entry.key}: ${entry.value}').join(', ')}
 ${ocrText.length > 8000 ? ocrText.substring(0, 8000) : ocrText}
 ''';
 
-  Map<String, dynamic> _responseSchema(List<String> categoryCodes) => {
-    'type': 'object',
+  static Map<String, dynamic> _responseSchema(List<String> categoryCodes) => {
+    'type': 'OBJECT',
     'properties': {
       'purchases': {
-        'type': 'array',
+        'type': 'ARRAY',
         'maxItems': 30,
         'items': {
-          'type': 'object',
+          'type': 'OBJECT',
           'properties': {
-            'merchant': {
-              'type': ['string', 'null'],
-            },
+            'merchant': {'type': 'STRING', 'nullable': true},
             'purchasedAt': {
-              'type': ['string', 'null'],
+              'type': 'STRING',
+              'nullable': true,
               'format': 'date-time',
             },
-            'totalAmount': {'type': 'integer', 'minimum': 0},
-            'paymentMethod': {
-              'type': ['string', 'null'],
-            },
-            'categoryCode': {'type': 'string', 'enum': categoryCodes},
+            'totalAmount': {'type': 'INTEGER', 'minimum': 0},
+            'paymentMethod': {'type': 'STRING', 'nullable': true},
+            'categoryCode': {'type': 'STRING', 'enum': categoryCodes},
             'items': {
-              'type': 'array',
+              'type': 'ARRAY',
               'items': {
-                'type': 'object',
+                'type': 'OBJECT',
                 'properties': {
-                  'name': {'type': 'string'},
-                  'quantity': {'type': 'integer', 'minimum': 1},
-                  'amount': {'type': 'integer', 'minimum': 0},
-                  'categoryCode': {'type': 'string', 'enum': categoryCodes},
+                  'name': {'type': 'STRING'},
+                  'quantity': {'type': 'INTEGER', 'minimum': 1},
+                  'amount': {'type': 'INTEGER', 'minimum': 0},
+                  'categoryCode': {'type': 'STRING', 'enum': categoryCodes},
                 },
                 'required': ['name', 'quantity', 'amount', 'categoryCode'],
               },
             },
-            'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+            'confidence': {'type': 'NUMBER', 'minimum': 0, 'maximum': 1},
             'warnings': {
-              'type': 'array',
-              'items': {'type': 'string'},
+              'type': 'ARRAY',
+              'items': {'type': 'STRING'},
             },
           },
           'required': [

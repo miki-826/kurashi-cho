@@ -133,6 +133,33 @@ void main() {
     expect(expenses.last.warnings, hasLength(1));
   });
 
+  test('Gemini request uses generateContent-compatible JSON output fields', () {
+    final request = GeminiCloudClient.createGenerateContentRequest(
+      imageBase64: 'base64-image',
+      imageMimeType: 'image/jpeg',
+      ocrText: '合計 1,280円',
+      categories: const {'food': '食費', 'other': 'その他'},
+    );
+
+    final generationConfig =
+        request['generationConfig'] as Map<String, dynamic>;
+    expect(generationConfig, isNot(contains('responseFormat')));
+    expect(generationConfig['responseMimeType'], 'application/json');
+    final schema = generationConfig['responseSchema'] as Map<String, dynamic>;
+    expect(schema['type'], 'OBJECT');
+    final properties = schema['properties'] as Map<String, dynamic>;
+    final purchases = properties['purchases'] as Map<String, dynamic>;
+    expect(purchases['type'], 'ARRAY');
+
+    final contents = request['contents'] as List<dynamic>;
+    final firstContent = contents.single as Map<String, dynamic>;
+    final parts = firstContent['parts'] as List<dynamic>;
+    final imagePart = parts.last as Map<String, dynamic>;
+    final inlineData = imagePart['inlineData'] as Map<String, dynamic>;
+    expect(inlineData['mimeType'], 'image/jpeg');
+    expect(inlineData['data'], 'base64-image');
+  });
+
   test('cloud candidates become independently editable receipt drafts', () {
     const candidate = CloudExpenseCandidate(
       merchant: 'まとめ買い',
